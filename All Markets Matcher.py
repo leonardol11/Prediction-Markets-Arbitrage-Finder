@@ -9,9 +9,21 @@ from openpyxl.utils import get_column_letter
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity as sk_cosine_sim
+from google import genai
 
 CUTOFF_DATE = datetime(2026, 5, 1, tzinfo=timezone.utc)
 MIN_VOLUME  = 10_000
+
+# ---------------------------------------------------------------------------
+# Gemini LLM Configuration
+# Get a free API key at: https://aistudio.google.com/apikey
+# Free tier: 15 requests/min, 1 500 requests/day for gemini-2.0-flash
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = "AIzaSyBI0QoXmIM_hiCuzN-NtCexFWilKe3tUN4"
+GEMINI_MODEL        = "gemini-2.5-flash"
+GEMINI_VERIFY_BATCH = 200
+
+_gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def _parse_iso(s: str):
@@ -132,8 +144,10 @@ STOPWORDS = {
     "us", "be", "st", "nd", "rd", "th", "say", "said", "says",
 }
 
-TFIDF_THRESHOLD    = 0.55
-COMBINED_THRESHOLD = 0.55
+TFIDF_THRESHOLD         = 0.30
+COMBINED_THRESHOLD      = 0.30
+MATCH_DISPLAY_THRESHOLD = 0.55
+GEMINI_CONFIDENCE_CUTOFF = 0.50
 
 # Synonym rules: longer/more-specific phrases first so they aren't partially
 # consumed by shorter rules that follow.
@@ -284,21 +298,23 @@ def months_compatible(a: str, b: str) -> bool:
 
 
 def find_matches(poly_markets, kalshi_markets) -> list:
+    """TF-IDF + Jaccard pre-filter.  Low thresholds to cast a wide net;
+    Gemini verifies the candidates afterwards."""
     poly_texts   = [m.get("question") or m.get("title") or "" for m in poly_markets]
     kalshi_texts = [_kalshi_title(m) for m in kalshi_markets]
 
-    print(f"Building TF-IDF for {len(poly_texts)} Poly + {len(kalshi_texts)} Kalshi markets...")
-    vec        = TfidfVectorizer(ngram_range=(1, 2), stop_words=list(STOPWORDS), sublinear_tf=True)
+    print(f"  Building TF-IDF matrix ({len(poly_texts)} × {len(kalshi_texts)})...")
     all_norm   = [normalize_for_matching(t) for t in poly_texts + kalshi_texts]
+    vec        = TfidfVectorizer(ngram_range=(1, 2), stop_words=list(STOPWORDS), sublinear_tf=True)
     tfidf      = vec.fit_transform(all_norm)
     sim_matrix = sk_cosine_sim(tfidf[:len(poly_texts)], tfidf[len(poly_texts):])
 
     candidates = np.argwhere(sim_matrix >= TFIDF_THRESHOLD)
-    print(f"  {len(candidates)} candidates above TF-IDF threshold {TFIDF_THRESHOLD}")
+    print(f"  {len(candidates)} pairs above TF-IDF threshold ({TFIDF_THRESHOLD})")
 
+    print(f"  Filtering (numbers, months, entities, dates, Jaccard)...")
     poly_tok   = [set(tokenize(t)) for t in poly_texts]
     kalshi_tok = [set(tokenize(t)) for t in kalshi_texts]
-
     poly_ent   = [extract_entities(t) for t in poly_texts]
     kalshi_ent = [extract_entities(t) for t in kalshi_texts]
 
@@ -348,9 +364,131 @@ def find_matches(poly_markets, kalshi_markets) -> list:
 
     matches.sort(key=lambda x: x[3], reverse=True)
     print(f"  Rejected: {rej_num} numbers, {rej_mon} months, "
-          f"{rej_ent} entities, {rej_date} date proximity, "
-          f"{rej_combined} combined score → {len(matches)} matches")
+          f"{rej_ent} entities, {rej_date} dates, "
+          f"{rej_combined} combined score")
+    print(f"  → {len(matches)} candidates passed pre-filter")
     return matches
+
+
+# ---------------------------------------------------------------------------
+# Gemini LLM verification
+# ---------------------------------------------------------------------------
+
+def _call_gemini_verify(pairs_text: str, max_retries: int = 3) -> list:
+    """Ask Gemini to confirm/reject a batch of candidate pairs."""
+    prompt = (
+        "You are a prediction-market analyst. A text-similarity algorithm "
+        "flagged the candidate pairs below as potential matches between "
+        "Polymarket and Kalshi. Verify each one.\n\n"
+        f"{pairs_text}\n\n"
+        "For each pair, decide whether the two markets resolve on the EXACT "
+        "same outcome.\n\n"
+        "Rules:\n"
+        "- Differently-worded titles are fine IF they resolve identically.\n"
+        "- If one title includes a year (e.g. '2026') and the other omits it, "
+        "that is still a match as long as both clearly refer to the same event.\n"
+        "- REJECT pairs only when they have genuinely CONFLICTING numbers or "
+        "thresholds (e.g. 'above 3%' vs 'above 4%', or '$100k' vs '$80k').\n"
+        "- REJECT pairs about different entities (e.g. different people, "
+        "teams, or countries).\n"
+        "- REJECT pairs where the questions ask fundamentally different things, "
+        "not just minor wording differences.\n\n"
+        'Return ONLY a JSON array (no markdown fences, no explanation). '
+        "Include ONLY confirmed matches. Each element:\n"
+        '{"pair_index": <int>, "confidence": <float 0-1>, '
+        '"shared_keywords": [<strings>]}\n\n'
+        "If no pairs are valid matches, return: []"
+    )
+
+    for attempt in range(max_retries):
+        try:
+            response = _gemini_client.models.generate_content(
+                model=GEMINI_MODEL, contents=prompt,
+            )
+            raw = response.text.strip()
+
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+
+            result = json.loads(raw)
+            if not isinstance(result, list):
+                raise ValueError(f"Expected JSON array, got {type(result).__name__}")
+            return result
+
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"    Attempt {attempt + 1}/{max_retries}: bad JSON – {exc}")
+            if attempt < max_retries - 1:
+                time.sleep(10)
+        except Exception as exc:
+            is_rate_limit = "429" in str(exc)
+            wait = 60 if is_rate_limit else 10
+            print(f"    Attempt {attempt + 1}/{max_retries}: "
+                  f"{'rate limited' if is_rate_limit else 'API error'} – "
+                  f"waiting {wait}s...")
+            if attempt < max_retries - 1:
+                time.sleep(wait)
+
+    print("  ⚠ Gemini API quota exhausted — create a new key in a new project at:")
+    print("    https://aistudio.google.com/apikey")
+    return []
+
+
+def verify_matches_with_llm(matches: list) -> list:
+    """Send TF-IDF candidate matches to Gemini for semantic verification."""
+    if not matches:
+        print("  No candidates to verify — skipping Gemini.")
+        return []
+
+    n_batches = (len(matches) + GEMINI_VERIFY_BATCH - 1) // GEMINI_VERIFY_BATCH
+    print(f"  {len(matches)} candidates → {n_batches} API call(s) "
+          f"(batch size {GEMINI_VERIFY_BATCH})")
+
+    verified = []
+    bs = GEMINI_VERIFY_BATCH
+
+    for start in range(0, len(matches), bs):
+        batch = matches[start:start + bs]
+        batch_num = start // bs + 1
+
+        pairs_text = "\n".join(
+            f"Pair {i}:\n"
+            f"  Polymarket: {p.get('question') or p.get('title') or ''}\n"
+            f"  Kalshi:     {_kalshi_title(k)}"
+            for i, (p, k, _shared, _score) in enumerate(batch)
+        )
+
+        print(f"  Sending batch {batch_num}/{n_batches} to Gemini "
+              f"({len(batch)} pairs)...")
+        results = _call_gemini_verify(pairs_text)
+        confirmed_this_batch = 0
+
+        for r in results:
+            idx = r.get("pair_index")
+            if idx is None:
+                continue
+            if not isinstance(idx, int) or idx < 0 or idx >= len(batch):
+                continue
+
+            p, k, old_shared, old_score = batch[idx]
+            conf = float(r.get("confidence", old_score))
+            if conf < GEMINI_CONFIDENCE_CUTOFF:
+                continue
+            shared = set(r.get("shared_keywords", old_shared))
+            verified.append((p, k, shared, conf))
+            confirmed_this_batch += 1
+
+        print(f"    Gemini confirmed {confirmed_this_batch}/{len(batch)} "
+              f"pairs in this batch")
+
+        if start + len(batch) < len(matches):
+            print(f"    Waiting 5s before next batch (rate limit)...")
+            time.sleep(5)
+
+    verified.sort(key=lambda x: x[3], reverse=True)
+    print(f"  → {len(verified)} verified matches, "
+          f"{len(matches) - len(verified)} rejected by Gemini")
+    return verified
 
 
 def find_arbitrage(matches: list) -> list:
@@ -472,8 +610,8 @@ def _kalshi_spread(market: dict) -> str:
 OUTPUT_FILE = "/Users/leonardoliu/Downloads/Fetch Market/all_market_matches.xlsx"
 
 
-def export_to_excel(poly_markets, kalshi_markets, matches=None, arbs=None,
-                    filename=OUTPUT_FILE):
+def export_to_excel(poly_markets, kalshi_markets, matches=None,
+                    verified=None, arbs=None, filename=OUTPUT_FILE):
     wb = Workbook()
     ws = wb.active
     ws.title = "Markets"
@@ -564,50 +702,52 @@ def export_to_excel(poly_markets, kalshi_markets, matches=None, arbs=None,
 
     ws.freeze_panes = "A3"
 
-    if matches:
-        ms = wb.create_sheet(title="Matches")
+    MATCH_COLS = {
+        "match": (1, 4), "sim": (2, 8),
+        "p_title": (3, 48), "p_date": (4, 12),
+        "p_yes": (5, 9), "p_no": (6, 9), "p_spread": (7, 11), "p_vtot": (8, 14),
+        "gap": (9, 3),
+        "k_title": (10, 48), "k_date": (11, 12),
+        "k_yes": (12, 9), "k_no": (13, 9), "k_spread": (14, 11), "k_vtot": (15, 14),
+        "shared": (16, 36),
+    }
+    MATCH_TEXT = {MATCH_COLS["p_title"][0], MATCH_COLS["k_title"][0], MATCH_COLS["shared"][0]}
 
-        MATCH_COLS = {
-            "match":    ( 1,  4), "sim":      ( 2,  8),
-            "p_title":  ( 3, 48), "p_date":   ( 4, 12),
-            "p_yes":    ( 5,  9), "p_no":     ( 6,  9),
-            "p_spread": ( 7, 11), "p_vtot":   ( 8, 14),
-            "gap":      ( 9,  3),
-            "k_title":  (10, 48), "k_date":   (11, 12),
-            "k_yes":    (12,  9), "k_no":     (13,  9),
-            "k_spread": (14, 11), "k_vtot":   (15, 14), "shared": (16, 36),
-        }
-        MATCH_LABELS = {
-            "match": "#", "sim": "Similarity",
+    def _write_match_sheet(title, score_label, rows):
+        if not rows:
+            return
+        sh = wb.create_sheet(title=title)
+        labels = {
+            "match": "#", "sim": score_label,
             "p_title": "Polymarket Title", "p_date": "Resolves",
             "p_yes": "Yes (¢)", "p_no": "No (¢)", "p_spread": "Spread (¢)", "p_vtot": "Vol Total ($)",
             "k_title": "Kalshi Title", "k_date": "Est. Resolves",
             "k_yes": "Yes (¢)", "k_no": "No (¢)", "k_spread": "Spread (¢)", "k_vtot": "Vol Total ($)",
             "shared": "Shared Keywords",
         }
-        TEXT_COLS = {MATCH_COLS["p_title"][0], MATCH_COLS["k_title"][0], MATCH_COLS["shared"][0]}
-        setup_headers(ms, MATCH_COLS, MATCH_LABELS, TEXT_COLS)
+        setup_headers(sh, MATCH_COLS, labels, MATCH_TEXT)
+        for i, (p, k, shared, score) in enumerate(rows):
+            r = i + 2
+            sh.row_dimensions[r].height = 32
+            body(sh.cell(r, 1),  i + 1,                                           "center")
+            body(sh.cell(r, 2),  f"{score:.0%}",                                  "center")
+            body(sh.cell(r, 3),  p.get("question") or p.get("title") or "")
+            body(sh.cell(r, 4),  (p.get("endDate") or "")[:10],                   "center")
+            body(sh.cell(r, 5),  _poly_yes(p),                                    "center")
+            body(sh.cell(r, 6),  _poly_no(p),                                     "center")
+            body(sh.cell(r, 7),  _poly_spread(p),                                 "center")
+            body(sh.cell(r, 8),  _vol(p.get("volume")),                           "right")
+            body(sh.cell(r, 10), _kalshi_title(k))
+            body(sh.cell(r, 11), _kalshi_date(k),                                 "center")
+            body(sh.cell(r, 12), _kalshi_yes(k),                                  "center")
+            body(sh.cell(r, 13), _kalshi_no(k),                                   "center")
+            body(sh.cell(r, 14), _kalshi_spread(k),                               "center")
+            body(sh.cell(r, 15), _vol(k.get("volume_fp")),                        "right")
+            body(sh.cell(r, 16), ", ".join(sorted(shared)) if shared else "—")
+        sh.freeze_panes = "A2"
 
-        for i, (p, k, shared, cosine) in enumerate(matches):
-            row = i + 2
-            ms.row_dimensions[row].height = 32
-            body(ms.cell(row, MATCH_COLS["match"][0]),    i + 1,                          "center")
-            body(ms.cell(row, MATCH_COLS["sim"][0]),      f"{cosine:.0%}",                 "center")
-            body(ms.cell(row, MATCH_COLS["p_title"][0]),  p.get("question") or p.get("title") or "")
-            body(ms.cell(row, MATCH_COLS["p_date"][0]),   (p.get("endDate") or "")[:10],  "center")
-            body(ms.cell(row, MATCH_COLS["p_yes"][0]),    _poly_yes(p),                    "center")
-            body(ms.cell(row, MATCH_COLS["p_no"][0]),     _poly_no(p),                     "center")
-            body(ms.cell(row, MATCH_COLS["p_spread"][0]), _poly_spread(p),                 "center")
-            body(ms.cell(row, MATCH_COLS["p_vtot"][0]),   _vol(p.get("volume")),           "right")
-            body(ms.cell(row, MATCH_COLS["k_title"][0]),  _kalshi_title(k))
-            body(ms.cell(row, MATCH_COLS["k_date"][0]),   _kalshi_date(k),                 "center")
-            body(ms.cell(row, MATCH_COLS["k_yes"][0]),    _kalshi_yes(k),                  "center")
-            body(ms.cell(row, MATCH_COLS["k_no"][0]),     _kalshi_no(k),                   "center")
-            body(ms.cell(row, MATCH_COLS["k_spread"][0]), _kalshi_spread(k),               "center")
-            body(ms.cell(row, MATCH_COLS["k_vtot"][0]),   _vol(k.get("volume_fp")),        "right")
-            body(ms.cell(row, MATCH_COLS["shared"][0]),   ", ".join(sorted(shared)) if shared else "—")
-
-        ms.freeze_panes = "A2"
+    _write_match_sheet("Matches",          "Similarity",  matches)
+    _write_match_sheet("LLM Checker",      "Confidence",  verified)
 
     if arbs is not None:
         ab = wb.create_sheet(title="Arbitrage")
@@ -685,25 +825,52 @@ def export_to_excel(poly_markets, kalshi_markets, matches=None, arbs=None,
     print(f"\n  Excel file saved → {filename}")
 
 
+def _step(n, total, label):
+    print(f"\n{'=' * 60}\nSTEP {n}/{total} — {label}\n{'=' * 60}")
+
+
 def main():
-    poly   = fetch_poly_markets()
+    total = 6
+
+    _step(1, total, "Fetching Polymarket markets")
+    poly = fetch_poly_markets()
+
+    _step(2, total, "Fetching Kalshi markets")
     kalshi = fetch_kalshi_markets()
 
-    print("\nMatching...\n")
-    matches = find_matches(poly, kalshi)
+    _step(3, total, "TF-IDF pre-filter (local)")
+    candidates = find_matches(poly, kalshi)
+    matches = [c for c in candidates if c[3] >= MATCH_DISPLAY_THRESHOLD]
+    print(f"  {len(matches)} at ≥{MATCH_DISPLAY_THRESHOLD} → 'Matches' sheet")
 
-    print("\nChecking for arbitrage...\n")
-    arbs = find_arbitrage(matches)
+    _step(4, total, "Gemini LLM verification")
+    verified = verify_matches_with_llm(matches)
 
-    export_to_excel(poly, kalshi, matches=matches, arbs=arbs)
-
-    print(f"\nDone.")
-    if matches:
-        print(f"  {len(matches)} match(es) → 'Matches' sheet")
-    if arbs:
-        print(f"  {len(arbs)} arbitrage opportunity/ies → 'Arbitrage' sheet (sorted by profit margin)")
+    if verified:
+        arb_source = verified
+        arb_label = "LLM Checker"
     else:
-        print("  No arbitrage opportunities found.")
+        arb_source = matches
+        arb_label = "Matches"
+        print("  ⚠ No verified matches from Gemini — falling back to TF-IDF Matches for arbitrage")
+
+    _step(5, total, "Arbitrage scan")
+    arbs = find_arbitrage(arb_source)
+
+    _step(6, total, "Excel export")
+    export_to_excel(poly, kalshi, matches=matches,
+                    verified=verified, arbs=arbs)
+
+    print(f"\n{'=' * 60}\nDONE\n{'=' * 60}")
+    print(f"  Poly: {len(poly)}  |  Kalshi: {len(kalshi)}")
+    print(f"  TF-IDF candidates: {len(candidates)}  |  Matches (≥{MATCH_DISPLAY_THRESHOLD}): {len(matches)}")
+    print(f"  Gemini verified (≥{GEMINI_CONFIDENCE_CUTOFF:.0%}): {len(verified)}  |  Arb opps: {len(arbs)}")
+    print(f"  Arbitrage source: '{arb_label}' sheet")
+    for sheet, count in [("Matches", len(matches)),
+                         ("LLM Checker", len(verified)),
+                         ("Arbitrage", len(arbs))]:
+        if count:
+            print(f"  → '{sheet}' sheet: {count}")
 
 
 if __name__ == "__main__":
