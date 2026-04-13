@@ -11,16 +11,16 @@ from openpyxl.utils import get_column_letter
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity as sk_cosine_sim
-from groq import Groq
+import anthropic
 
 CUTOFF_DATE = datetime(2026, 7, 1, tzinfo=timezone.utc)
 MIN_VOLUME  = 25_000
 
-GROQ_API_KEY = "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"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
+CLAUDE_MODEL = "claude-sonnet-4-6"
 GROQ_VERIFY_BATCH = 50
 
-_groq_client = Groq(api_key=GROQ_API_KEY)
+_anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 def _parse_iso(s: str):
@@ -28,6 +28,7 @@ def _parse_iso(s: str):
         return datetime.fromisoformat((s or "").replace("Z", "+00:00"))
     except ValueError:
         return None
+
 
 
 POLY_BASE = "https://gamma-api.polymarket.com"
@@ -231,13 +232,31 @@ def fetch_kalshi_orderbook(ticker: str):
         return (None, None), (None, None)
 
 
-def _clob_yes_no_tokens(m: dict):
-    raw = m.get("clobTokenIds", "[]")
+def _clob_all_tokens(m: dict) -> list:
+    """Return list of (outcome_label, token_id) for all outcomes.
+    For binary markets returns [(YES_label, yes_token), (NO_label, no_token)].
+    For multi-outcome returns one tuple per outcome.
+    """
+    raw_tokens = m.get("clobTokenIds", "[]")
     try:
-        t = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        tokens = json.loads(raw_tokens) if isinstance(raw_tokens, str) else (raw_tokens or [])
     except (json.JSONDecodeError, TypeError):
-        return None
-    return (t[0], t[1]) if len(t) >= 2 else None
+        return []
+
+    raw_outcomes = m.get("outcomes", "[]")
+    try:
+        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else (raw_outcomes or [])
+    except (json.JSONDecodeError, TypeError):
+        outcomes = []
+
+    if not tokens:
+        return []
+
+    if len(tokens) == len(outcomes):
+        return list(zip([str(o) for o in outcomes], tokens))
+
+    # Fallback: label by index
+    return [(f"outcome_{i}", t) for i, t in enumerate(tokens)]
 
 
 def fetch_all_orderbooks(poly_markets: list, kalshi_markets: list) -> tuple:
@@ -245,9 +264,9 @@ def fetch_all_orderbooks(poly_markets: list, kalshi_markets: list) -> tuple:
     poly_tasks = []
     total = 0
     for i, m in enumerate(poly_markets):
-        pair = _clob_yes_no_tokens(m)
-        if pair:
-            poly_tasks.append((i, pair[0], pair[1]))
+        pairs = _clob_all_tokens(m)
+        if len(pairs) >= 2:
+            poly_tasks.append((i, pairs[0][1], pairs[1][1]))
             total += 2
     for m in kalshi_markets:
         if m.get("ticker"):
@@ -256,7 +275,7 @@ def fetch_all_orderbooks(poly_markets: list, kalshi_markets: list) -> tuple:
     if total == 0:
         return poly_ob, kalshi_ob
 
-    valid_tokens = sum(1 for m in poly_markets if _clob_yes_no_tokens(m))
+    valid_tokens = sum(1 for m in poly_markets if len(_clob_all_tokens(m)) >= 2)
     print(f"  Poly markets with valid clobTokenIds: {valid_tokens}/{len(poly_markets)}")
 
     print(f"  Fetching {total} orderbooks in parallel…")
@@ -309,6 +328,13 @@ STOPWORDS = {
     "2024", "2025", "2026", "2027",
     "above", "below", "least", "most", "per", "end", "date",
     "us", "be", "st", "nd", "rd", "th", "say", "said", "says",
+    # Sports domain vocabulary
+    "premier", "league", "relegated", "relegation", "championship",
+    "season", "cup", "division", "playoff", "finals", "semifinal",
+    "winner", "champion", "trophy", "match", "game", "series",
+    # Prediction market boilerplate
+    "price", "reach", "hit", "close",
+    "market", "resolve", "resolution", "question",
 }
 
 TFIDF_THRESHOLD         = 0.45
@@ -442,6 +468,43 @@ def extract_entities(text: str) -> set:
     return entities
 
 
+_SOFT_ENTITY_RE = re.compile(r'\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,2})\b')
+_PUNCT_STRIP = re.compile(r"[^\w\s]")
+
+
+def extract_soft_entities(text: str) -> set:
+    """Extract capitalized word sequences (1–3 words) as soft named entities.
+
+    Operates on the original (un-lowercased) text so only genuinely capitalized
+    tokens are captured. Returns a set of lowercased, punctuation-stripped tokens
+    with stopwords and short/numeric tokens excluded.
+
+    Only lowercases the first character when the first word is a stopword (e.g.
+    "Will"), so that question-form openers don't absorb the adjacent entity into
+    a spurious multi-word phrase, while statement-form titles whose first word IS
+    the entity (e.g. "Burnley Relegated…") are left intact.
+    """
+    if text:
+        first_word_m = re.match(r'[A-Za-z]+', text)
+        if first_word_m and first_word_m.group(0).lower() in STOPWORDS:
+            text = text[0].lower() + text[1:]
+    entities = set()
+    for m in _SOFT_ENTITY_RE.finditer(text):
+        phrase = m.group(1)
+        tokens = phrase.split()
+        # Multi-word: add the full phrase and each individual word
+        candidates = tokens if len(tokens) == 1 else [phrase] + tokens
+        for token in candidates:
+            normalized = _PUNCT_STRIP.sub("", token).lower().strip()
+            if (not normalized
+                    or len(normalized) < 3
+                    or normalized in STOPWORDS
+                    or normalized.isdigit()):
+                continue
+            entities.add(normalized)
+    return entities
+
+
 _ABOVE_RE = re.compile(
     r'\b(?:above|over|more\s+than|greater\s+than|exceed(?:s|ing)?|'
     r'at\s+least|higher\s+than)\b', re.I)
@@ -495,6 +558,8 @@ def find_matches(poly_markets, kalshi_markets) -> list:
     kalshi_tok = [set(tokenize(t)) for t in kalshi_texts]
     poly_ent   = [extract_entities(t) for t in poly_texts]
     kalshi_ent = [extract_entities(t) for t in kalshi_texts]
+    poly_soft  = [extract_soft_entities(t) for t in poly_texts]
+    kalshi_soft = [extract_soft_entities(t) for t in kalshi_texts]
 
     poly_dates = [
         _parse_iso(m.get("endDate") or m.get("end_date_iso"))
@@ -519,6 +584,9 @@ def find_matches(poly_markets, kalshi_markets) -> list:
             rej_mon += 1
             continue
         if _sets_clash(poly_ent[i], kalshi_ent[j]):
+            rej_ent += 1
+            continue
+        if _sets_clash(poly_soft[i], kalshi_soft[j]):
             rej_ent += 1
             continue
 
@@ -575,12 +643,12 @@ def _call_groq_verify(pairs_text: str, max_retries: int = 3) -> list:
 
     for attempt in range(max_retries):
         try:
-            response = _groq_client.chat.completions.create(
-                model=GROQ_MODEL,
+            response = _anthropic_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0,
             )
-            raw = response.choices[0].message.content.strip()
+            raw = response.content[0].text.strip()
 
             if raw.startswith("```"):
                 raw = re.sub(r"^```(?:json)?\n?", "", raw)
@@ -604,13 +672,13 @@ def _call_groq_verify(pairs_text: str, max_retries: int = 3) -> list:
             if attempt < max_retries - 1:
                 time.sleep(wait)
 
-    print("  ⚠ Groq API quota exhausted — create a new key at https://console.groq.com/keys")
+    print("  ⚠ Claude API error — check your ANTHROPIC_API_KEY")
     return []
 
 
 def verify_matches_with_llm(matches: list) -> list:
     if not matches:
-        print("  No candidates to verify — skipping Groq.")
+        print("  No candidates to verify — skipping Claude.")
         return []
 
     n_batches = (len(matches) + GROQ_VERIFY_BATCH - 1) // GROQ_VERIFY_BATCH
@@ -631,7 +699,7 @@ def verify_matches_with_llm(matches: list) -> list:
             for i, (p, k, _shared, _score) in enumerate(batch)
         )
 
-        print(f"  Sending batch {batch_num}/{n_batches} to Groq "
+        print(f"  Sending batch {batch_num}/{n_batches} to Claude "
               f"({len(batch)} pairs)...")
         results = _call_groq_verify(pairs_text)
         confirmed_this_batch = 0
@@ -648,11 +716,8 @@ def verify_matches_with_llm(matches: list) -> list:
             verified.append((p, k, shared, conf))
             confirmed_this_batch += 1
 
-        print(f"    Groq confirmed {confirmed_this_batch}/{len(batch)} "
+        print(f"    Claude confirmed {confirmed_this_batch}/{len(batch)} "
               f"pairs in this batch")
-
-        if start + len(batch) < len(matches):
-            time.sleep(15)
 
     verified.sort(key=lambda x: x[3], reverse=True)
     print(f"  → {len(verified)} verified / {len(matches)} candidates")
@@ -1062,51 +1127,97 @@ def export_to_excel(poly_markets, kalshi_markets, matches=None,
         TEXT_ARB = {ARB_COLS["p_title"][0], ARB_COLS["k_title"][0]}
         setup_headers(ab, ARB_COLS, ARB_LABELS, TEXT_ARB)
 
-        if arbs:
-            for i, arb in enumerate(arbs):
-                row = i + 2
-                ab.row_dimensions[row].height = 32
-                p, k = arb["poly"], arb["kalshi"]
-                pob = {"yes": arb.get("poly_ob_yes"), "no": arb.get("poly_ob_no")}
-                kob = arb.get("kalshi_ob")
-                p_bet = arb["a_side"] if arb["a_plat"] == "Polymarket" else arb["b_side"]
-                k_bet = arb["b_side"] if arb["b_plat"] == "Kalshi" else arb["a_side"]
+        from datetime import date as _date
+        today_str = _date.today().isoformat()
 
-                body(ab.cell(row, ARB_COLS["num"][0]), i + 1, "center")
-                body(ab.cell(row, ARB_COLS["margin"][0]), f"{arb['margin']:.2%}", "center")
-                body(ab.cell(row, ARB_COLS["p_title"][0]), p.get("question") or p.get("title") or "")
-                yp, yq, np_, nq = _fmt_poly_asks(pob.get("yes"), pob.get("no"))
-                body(ab.cell(row, ARB_COLS["p_yes"][0]), yp, "center")
-                body(ab.cell(row, ARB_COLS["p_yes_q"][0]), yq, "right")
-                body(ab.cell(row, ARB_COLS["p_no"][0]), np_, "center")
-                body(ab.cell(row, ARB_COLS["p_no_q"][0]), nq, "right")
-                if p_bet == "YES":
-                    ab.cell(row, ARB_COLS["p_yes"][0]).font = BOLD_BODY
-                    ab.cell(row, ARB_COLS["p_yes_q"][0]).font = BOLD_BODY
+        def _exp_date(arb):
+            k = arb["kalshi"]
+            p = arb["poly"]
+            return (_kalshi_date(k) or (p.get("endDate") or p.get("end_date_iso") or "")[:10])
+
+        regular_arbs = [a for a in arbs if _exp_date(a) != today_str]
+        live_arbs    = [a for a in arbs if _exp_date(a) == today_str]
+
+        def _write_arb_row(sheet, row, i, arb):
+            sheet.row_dimensions[row].height = 32
+            p, k = arb["poly"], arb["kalshi"]
+            pob = {"yes": arb.get("poly_ob_yes"), "no": arb.get("poly_ob_no")}
+            kob = arb.get("kalshi_ob")
+            p_bet = arb["a_side"] if arb["a_plat"] == "Polymarket" else arb["b_side"]
+            k_bet = arb["b_side"] if arb["b_plat"] == "Kalshi" else arb["a_side"]
+
+            body(sheet.cell(row, ARB_COLS["num"][0]), i + 1, "center")
+            body(sheet.cell(row, ARB_COLS["margin"][0]), f"{arb['margin']:.2%}", "center")
+            body(sheet.cell(row, ARB_COLS["p_title"][0]), p.get("question") or p.get("title") or "")
+            yp, yq, np_, nq = _fmt_poly_asks(pob.get("yes"), pob.get("no"))
+            body(sheet.cell(row, ARB_COLS["p_yes"][0]), yp, "center")
+            body(sheet.cell(row, ARB_COLS["p_yes_q"][0]), yq, "right")
+            body(sheet.cell(row, ARB_COLS["p_no"][0]), np_, "center")
+            body(sheet.cell(row, ARB_COLS["p_no_q"][0]), nq, "right")
+            if p_bet == "YES":
+                sheet.cell(row, ARB_COLS["p_yes"][0]).font = BOLD_BODY
+                sheet.cell(row, ARB_COLS["p_yes_q"][0]).font = BOLD_BODY
+            else:
+                sheet.cell(row, ARB_COLS["p_no"][0]).font = BOLD_BODY
+                sheet.cell(row, ARB_COLS["p_no_q"][0]).font = BOLD_BODY
+            body(sheet.cell(row, ARB_COLS["p_vtot"][0]), _vol(p.get("volume")), "right")
+            body(sheet.cell(row, ARB_COLS["k_title"][0]), _kalshi_title(k))
+            ky, kyq, kn, knq = _fmt_kalshi_asks(kob)
+            body(sheet.cell(row, ARB_COLS["k_yes"][0]), ky, "center")
+            body(sheet.cell(row, ARB_COLS["k_yes_q"][0]), kyq, "right")
+            body(sheet.cell(row, ARB_COLS["k_no"][0]), kn, "center")
+            body(sheet.cell(row, ARB_COLS["k_no_q"][0]), knq, "right")
+            if k_bet == "YES":
+                sheet.cell(row, ARB_COLS["k_yes"][0]).font = BOLD_BODY
+                sheet.cell(row, ARB_COLS["k_yes_q"][0]).font = BOLD_BODY
+            else:
+                sheet.cell(row, ARB_COLS["k_no"][0]).font = BOLD_BODY
+                sheet.cell(row, ARB_COLS["k_no_q"][0]).font = BOLD_BODY
+            body(sheet.cell(row, ARB_COLS["k_vtot"][0]), _vol(k.get("volume_fp")), "right")
+            exp = (_kalshi_date(k) or p.get("endDate") or p.get("end_date_iso") or "—")[:10]
+            body(sheet.cell(row, ARB_COLS["expiration"][0]), exp, "center")
+
+        def _write_arb_header(sheet, row):
+            sheet.row_dimensions[row].height = 22
+            for key, (col, _) in ARB_COLS.items():
+                if key == "gap":
+                    sheet.cell(row, col).fill = HDR_FILL
                 else:
-                    ab.cell(row, ARB_COLS["p_no"][0]).font = BOLD_BODY
-                    ab.cell(row, ARB_COLS["p_no_q"][0]).font = BOLD_BODY
-                body(ab.cell(row, ARB_COLS["p_vtot"][0]), _vol(p.get("volume")), "right")
-                body(ab.cell(row, ARB_COLS["k_title"][0]), _kalshi_title(k))
-                ky, kyq, kn, knq = _fmt_kalshi_asks(kob)
-                body(ab.cell(row, ARB_COLS["k_yes"][0]), ky, "center")
-                body(ab.cell(row, ARB_COLS["k_yes_q"][0]), kyq, "right")
-                body(ab.cell(row, ARB_COLS["k_no"][0]), kn, "center")
-                body(ab.cell(row, ARB_COLS["k_no_q"][0]), knq, "right")
-                if k_bet == "YES":
-                    ab.cell(row, ARB_COLS["k_yes"][0]).font = BOLD_BODY
-                    ab.cell(row, ARB_COLS["k_yes_q"][0]).font = BOLD_BODY
-                else:
-                    ab.cell(row, ARB_COLS["k_no"][0]).font = BOLD_BODY
-                    ab.cell(row, ARB_COLS["k_no_q"][0]).font = BOLD_BODY
-                body(ab.cell(row, ARB_COLS["k_vtot"][0]), _vol(k.get("volume_fp")), "right")
-                exp = (_kalshi_date(k) or p.get("endDate") or p.get("end_date_iso") or "—")[:10]
-                body(ab.cell(row, ARB_COLS["expiration"][0]), exp, "center")
-        else:
+                    hdr(sheet.cell(row, col), ARB_LABELS[key],
+                        align="left" if col in TEXT_ARB else "center")
+
+        if not regular_arbs and not live_arbs:
             ab.row_dimensions[2].height = 28
             c = ab.cell(2, 1, "No arbitrage opportunities found in current matches.")
             c.font = BODY_FONT
             c.alignment = Alignment(horizontal="left", vertical="center")
+        else:
+            for i, arb in enumerate(regular_arbs):
+                _write_arb_row(ab, i + 2, i, arb)
+
+            if live_arbs:
+                if regular_arbs:
+                    label_row = 2 + len(regular_arbs) + 2  # 2 blank rows after section 1
+                else:
+                    label_row = 2
+                header_row = label_row + 1
+                data_start  = header_row + 1
+
+                last_col = max(col for col, _ in ARB_COLS.values())
+                ab.merge_cells(
+                    start_row=label_row, start_column=1,
+                    end_row=label_row,   end_column=last_col,
+                )
+                lc = ab.cell(label_row, 1, "LIVE MARKETS — Expiring Today")
+                lc.fill      = PatternFill("solid", fgColor="2B2B2B")
+                lc.font      = Font(bold=False, color="FFFFFF", size=10, name="Calibri")
+                lc.alignment = Alignment(horizontal="left", vertical="center")
+                ab.row_dimensions[label_row].height = 18
+
+                _write_arb_header(ab, header_row)
+
+                for i, arb in enumerate(live_arbs):
+                    _write_arb_row(ab, data_start + i, i, arb)
 
         ab.freeze_panes = "A2"
         wb.move_sheet(ab, offset=-wb.index(ab))
@@ -1134,14 +1245,14 @@ def main():
     matches = [c for c in candidates if c[3] >= MATCH_DISPLAY_THRESHOLD]
     print(f"  {len(matches)} at ≥{MATCH_DISPLAY_THRESHOLD} → 'Matches' sheet")
 
-    _step(3, total, "Groq LLM verification")
+    _step(3, total, "Claude LLM verification")
     verified = verify_matches_with_llm(matches)
 
     if verified:
         arb_source, arb_label = verified, "LLM Checker"
     else:
         arb_source, arb_label = matches, "Matches"
-        print("  ⚠ Using TF-IDF matches for arbitrage (Groq verified none)")
+        print("  ⚠ Using TF-IDF matches for arbitrage (Claude verified none)")
 
     _step(4, total, "Fetching orderbooks (best ask + size per outcome)")
     matched_poly   = list({id(p): p for p, _k, _, _ in arb_source}.values())
@@ -1161,7 +1272,7 @@ def main():
     print(f"\n{'=' * 60}\nDONE\n{'=' * 60}")
     print(f"  Poly: {len(poly)}  |  Kalshi: {len(kalshi)}")
     print(f"  TF-IDF candidates: {len(candidates)}  |  Matches (≥{MATCH_DISPLAY_THRESHOLD}): {len(matches)}")
-    print(f"  Groq verified (≥{GROQ_CONFIDENCE_CUTOFF:.0%}): {len(verified)}  |  Arb opps: {len(arbs)}")
+    print(f"  Claude verified (≥{GROQ_CONFIDENCE_CUTOFF:.0%}): {len(verified)}  |  Arb opps: {len(arbs)}")
     print(f"  Arbitrage source: '{arb_label}' sheet")
     for sheet, count in [("Matches", len(matches)),
                          ("LLM Checker", len(verified)),
