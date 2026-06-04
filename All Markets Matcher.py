@@ -16,7 +16,7 @@ import anthropic
 CUTOFF_DATE = datetime(2026, 7, 1, tzinfo=timezone.utc)
 MIN_VOLUME  = 25_000
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
+##ANTHROPIC_API_KEY = 
 CLAUDE_MODEL = "claude-sonnet-4-6"
 GROQ_VERIFY_BATCH = 50
 
