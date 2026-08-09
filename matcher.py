@@ -16,11 +16,14 @@ import anthropic
 CUTOFF_DATE = datetime(2026, 7, 1, tzinfo=timezone.utc)
 MIN_VOLUME  = 25_000
 
-##ANTHROPIC_API_KEY = 
+# Read from the environment only — never hardcode keys in this file.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = "claude-sonnet-4-6"
 GROQ_VERIFY_BATCH = 50
 
-_anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+_anthropic_client = (
+    anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+)
 
 
 def _parse_iso(s: str):
@@ -681,6 +684,11 @@ def verify_matches_with_llm(matches: list) -> list:
         print("  No candidates to verify — skipping Claude.")
         return []
 
+    if _anthropic_client is None:
+        print("  ⚠ ANTHROPIC_API_KEY not set — skipping LLM verification.")
+        print("    (export ANTHROPIC_API_KEY=... to enable; falling back to TF-IDF matches)")
+        return []
+
     n_batches = (len(matches) + GROQ_VERIFY_BATCH - 1) // GROQ_VERIFY_BATCH
     print(f"  {len(matches)} candidates → {n_batches} API call(s) "
           f"(batch size {GROQ_VERIFY_BATCH})")
@@ -1226,6 +1234,101 @@ def export_to_excel(poly_markets, kalshi_markets, matches=None,
     print(f"\n  Excel file saved → {filename}")
 
 
+RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.json")
+
+
+def _poly_url(m: dict):
+    slug = m.get("slug")
+    return f"https://polymarket.com/market/{slug}" if slug else None
+
+
+def _num(v):
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def export_results_json(poly, kalshi, matches, verified, arbs,
+                        poly_ob, kalshi_ob, arb_label, filename=RESULTS_FILE):
+    poly_idx   = {id(m): i for i, m in enumerate(poly)}
+    kalshi_idx = {id(m): i for i, m in enumerate(kalshi)}
+
+    def match_row(p, k, shared, score):
+        return {
+            "score": round(float(score), 4),
+            "poly": {
+                "title":  p.get("question") or p.get("title") or "",
+                "date":   (p.get("endDate") or p.get("end_date_iso") or "")[:10],
+                "yes":    _num(_poly_price_raw(p, "Yes", 0)),
+                "no":     _num(_poly_price_raw(p, "No", 1)),
+                "volume": _num(p.get("volume")),
+                "url":    _poly_url(p),
+            },
+            "kalshi": {
+                "title":  _kalshi_title(k),
+                "date":   _kalshi_date(k),
+                "yes":    _num(_kalshi_price_raw(k, "yes_ask_dollars")),
+                "no":     _num(_kalshi_price_raw(k, "no_ask_dollars")),
+                "volume": _num(k.get("volume_fp")),
+                "ticker": k.get("ticker") or "",
+            },
+            "shared": sorted(shared) if shared else [],
+        }
+
+    from datetime import date as _date
+    today_str = _date.today().isoformat()
+
+    def arb_row(a):
+        p, k = a["poly"], a["kalshi"]
+        exp = (_kalshi_date(k) or (p.get("endDate") or p.get("end_date_iso") or ""))[:10]
+        return {
+            "margin":        round(float(a["margin"]), 4),
+            "prob_sum":      round(float(a["prob_sum"]), 4),
+            "max_contracts": _num(a.get("max_contracts")),
+            "legs": [
+                {"platform": a["a_plat"], "side": a["a_side"],
+                 "price": _num(a["a_price"]), "size": _num(a["a_ask_size"])},
+                {"platform": a["b_plat"], "side": a["b_side"],
+                 "price": _num(a["b_price"]), "size": _num(a["b_ask_size"])},
+            ],
+            "poly": {
+                "title":  p.get("question") or p.get("title") or "",
+                "volume": _num(p.get("volume")),
+                "url":    _poly_url(p),
+            },
+            "kalshi": {
+                "title":  _kalshi_title(k),
+                "volume": _num(k.get("volume_fp")),
+                "ticker": k.get("ticker") or "",
+            },
+            "expiration": exp,
+            "live": exp == today_str,
+        }
+
+    data = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "summary": {
+            "poly_markets":   len(poly),
+            "kalshi_markets": len(kalshi),
+            "matches":        len(matches),
+            "verified":       len(verified),
+            "arbs":           len(arbs),
+            "best_margin":    round(float(arbs[0]["margin"]), 4) if arbs else None,
+            "arb_source":     arb_label,
+            "min_volume":     MIN_VOLUME,
+            "cutoff_date":    CUTOFF_DATE.date().isoformat(),
+        },
+        "arbs":     [arb_row(a) for a in arbs],
+        "verified": [match_row(p, k, s, sc) for p, k, s, sc in verified],
+        "matches":  [match_row(p, k, s, sc) for p, k, s, sc in matches],
+    }
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=1)
+    print(f"  Results JSON saved → {filename}")
+    return data
+
+
 def _step(n, total, label):
     print(f"\n{'=' * 60}\nSTEP {n}/{total} — {label}\n{'=' * 60}")
 
@@ -1264,10 +1367,12 @@ def main():
     _step(5, total, "Arbitrage scan (CLOB / Kalshi best asks)")
     arbs = find_arbitrage(arb_source, matched_poly, matched_kalshi, poly_ob, kalshi_ob)
 
-    _step(6, total, "Excel export")
+    _step(6, total, "Excel + JSON export")
     export_to_excel(poly, kalshi, matches=matches,
                     verified=verified, arbs=arbs,
                     poly_ob=poly_ob, kalshi_ob=kalshi_ob)
+    results = export_results_json(poly, kalshi, matches, verified, arbs,
+                                  poly_ob, kalshi_ob, arb_label)
 
     print(f"\n{'=' * 60}\nDONE\n{'=' * 60}")
     print(f"  Poly: {len(poly)}  |  Kalshi: {len(kalshi)}")
@@ -1279,6 +1384,7 @@ def main():
                          ("Arbitrage", len(arbs))]:
         if count:
             print(f"  → '{sheet}' sheet: {count}")
+    return results
 
 
 if __name__ == "__main__":

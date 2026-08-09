@@ -1,0 +1,14 @@
+# Never commit secrets
+.env
+*.key
+
+# Generated output (your data stays local)
+results.json
+all_market_matches.xlsx
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

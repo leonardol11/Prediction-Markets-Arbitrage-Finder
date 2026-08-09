@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arbitrage Finder</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:           #f9f9f7;
+    --surface:        #fcfcfb;
+    --ink:            #0b0b0b;
+    --ink-2:          #52514e;
+    --muted:          #898781;
+    --grid:           #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --accent:         #2a78d6;
+    --accent-ink:     #ffffff;
+    --good:           #006300;
+    --good-chip-bg:   rgba(12,163,12,0.10);
+    --warn:           #8a5a00;
+    --warn-chip-bg:   rgba(250,178,25,0.18);
+    --chip-bg:        #f0efec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page:           #0d0d0d;
+      --surface:        #1a1a19;
+      --ink:            #ffffff;
+      --ink-2:          #c3c2b7;
+      --muted:          #898781;
+      --grid:           #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --accent:         #3987e5;
+      --accent-ink:     #ffffff;
+      --good:           #0ca30c;
+      --good-chip-bg:   rgba(12,163,12,0.14);
+      --warn:           #fab219;
+      --warn-chip-bg:   rgba(250,178,25,0.14);
+      --chip-bg:        #262624;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 24px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  header .sub { color: var(--muted); font-size: 12.5px; }
+  header .spacer { flex: 1; }
+
+  #runBtn {
+    background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 8px;
+    font: 600 13.5px/1 system-ui, sans-serif;
+    padding: 10px 18px; cursor: pointer;
+  }
+  #runBtn:hover { filter: brightness(1.08); }
+  #runBtn:disabled { opacity: 0.55; cursor: default; }
+  #runStatus { font-size: 12.5px; color: var(--ink-2); display: flex; align-items: center; gap: 7px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--baseline); }
+  .dot.running { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+
+  main { max-width: 1240px; margin: 0 auto; padding: 20px 24px 60px; }
+
+  .tiles {
+    display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    margin-bottom: 20px;
+  }
+  .tile {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 13px 16px 12px;
+  }
+  .tile .label { font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em;
+                 text-transform: uppercase; color: var(--muted); }
+  .tile .value { font-size: 26px; font-weight: 650; margin-top: 3px; letter-spacing: -0.01em; }
+  .tile .value.good { color: var(--good); }
+  .tile .note { font-size: 11.5px; color: var(--ink-2); margin-top: 1px; }
+
+  nav.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--grid); margin-bottom: 14px; }
+  nav.tabs button {
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    font: 600 13.5px/1 system-ui, sans-serif;
+    color: var(--ink-2); padding: 10px 14px 11px; cursor: pointer;
+  }
+  nav.tabs button:hover { color: var(--ink); }
+  nav.tabs button.active { color: var(--ink); border-bottom-color: var(--accent); }
+  nav.tabs .count { color: var(--muted); font-weight: 500; margin-left: 5px; }
+
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .toolbar input[type=search] {
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 12px; font: 13px system-ui, sans-serif; width: 280px;
+  }
+  .toolbar .hint { font-size: 12px; color: var(--muted); }
+
+  .panel { background: var(--surface); border: 1px solid var(--border);
+           border-radius: 10px; overflow: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th {
+    text-align: left; font-size: 11.5px; font-weight: 600;
+    letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted);
+    padding: 10px 12px; border-bottom: 1px solid var(--grid);
+    white-space: nowrap; position: sticky; top: 0; background: var(--surface);
+  }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--grid);
+       vertical-align: top; font-size: 13.5px; }
+  tr:last-child td { border-bottom: 0; }
+  tr:hover td { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.title { min-width: 220px; max-width: 340px; }
+  td .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  td.profit { color: var(--good); font-weight: 650; font-variant-numeric: tabular-nums; }
+
+  .chip {
+    display: inline-block; background: var(--chip-bg); border-radius: 6px;
+    padding: 3px 8px; font-size: 12.5px; margin: 1px 4px 1px 0;
+    white-space: nowrap; color: var(--ink-2);
+  }
+  .chip b { color: var(--ink); font-weight: 650; }
+  .badge-live {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: var(--warn-chip-bg); color: var(--warn);
+    border-radius: 6px; padding: 2px 8px; font-size: 11.5px; font-weight: 650;
+  }
+  .badge-live::before { content: "⏱"; }
+  .score-chip {
+    display: inline-block; background: var(--good-chip-bg); color: var(--good);
+    border-radius: 6px; padding: 2px 8px; font-size: 12.5px; font-weight: 650;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .empty { padding: 46px 20px; text-align: center; color: var(--muted); font-size: 13.5px; }
+  .empty .big { font-size: 15px; color: var(--ink-2); font-weight: 600; margin-bottom: 6px; }
+
+  #log {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin: 0;
+    font: 12px/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--ink-2); white-space: pre-wrap; word-break: break-word;
+    max-height: 480px; overflow: auto;
+  }
+  .error-banner {
+    background: rgba(208,59,59,0.10); color: #d03b3b;
+    border: 1px solid rgba(208,59,59,0.3); border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 14px; font-size: 13px;
+  }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Prediction Markets Arbitrage Finder</h1>
+    <div class="sub">Polymarket × Kalshi &nbsp;·&nbsp; <span id="generatedAt">no results yet</span></div>
+  </div>
+  <div class="spacer"></div>
+  <div id="runStatus"><span class="dot" id="statusDot"></span><span id="statusText">Idle</span></div>
+  <button id="runBtn">Run scan</button>
+</header>
+
+<main>
+  <div id="errorBanner" class="error-banner hidden"></div>
+
+  <section class="tiles" id="tiles"></section>
+
+  <nav class="tabs">
+    <button data-tab="arbs" class="active">Arbitrage<span class="count" id="cArbs"></span></button>
+    <button data-tab="verified">LLM verified<span class="count" id="cVerified"></span></button>
+    <button data-tab="matches">TF-IDF matches<span class="count" id="cMatches"></span></button>
+    <button data-tab="log">Scan log</button>
+  </nav>
+
+  <div class="toolbar" id="filterBar">
+    <input type="search" id="filter" placeholder="Filter by title or keyword…">
+    <span class="hint" id="filterHint"></span>
+  </div>
+
+  <div id="view-arbs" class="view"></div>
+  <div id="view-verified" class="view hidden"></div>
+  <div id="view-matches" class="view hidden"></div>
+  <div id="view-log" class="view hidden"><pre id="log">No scan output yet — press “Run scan”.</pre></div>
+</main>
+
+<script>
+"use strict";
+let DATA = null;
+let activeTab = "arbs";
+let polling = null;
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+const cents = (v) => v == null ? "—" : Math.round(v * 100) + "¢";
+const pct   = (v) => v == null ? "—" : (v * 100).toFixed(2) + "%";
+const vol   = (v) => v == null ? "—" : "$" + Math.round(v).toLocaleString();
+const qty   = (v) => v == null ? "—" : Math.round(v).toLocaleString();
+
+function tile(label, value, opts = {}) {
+  return `<div class="tile"><div class="label">${esc(label)}</div>
+    <div class="value ${opts.good ? "good" : ""}">${esc(value)}</div>
+    ${opts.note ? `<div class="note">${esc(opts.note)}</div>` : ""}</div>`;
+}
+
+function renderTiles() {
+  const el = $("#tiles");
+  if (!DATA) { el.innerHTML = ""; return; }
+  const s = DATA.summary;
+  el.innerHTML =
+    tile("Arbitrage opps", s.arbs, { good: s.arbs > 0, note: "from " + s.arb_source }) +
+    tile("Best margin", s.best_margin != null ? pct(s.best_margin) : "—",
+         { good: s.best_margin > 0 }) +
+    tile("LLM verified", s.verified) +
+    tile("TF-IDF matches", s.matches) +
+    tile("Polymarket", s.poly_markets.toLocaleString(), { note: "eligible markets" }) +
+    tile("Kalshi", s.kalshi_markets.toLocaleString(), { note: "eligible markets" });
+}
+
+function polyCell(p) {
+  const t = p.url ? `<a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a>`
+                  : esc(p.title);
+  const bits = [];
+  if (p.date) bits.push(p.date);
+  if (p.yes != null || p.no != null) bits.push(`Yes ${cents(p.yes)} / No ${cents(p.no)}`);
+  if (p.volume != null) bits.push(vol(p.volume) + " vol");
+  return `<td class="title">${t}<div class="meta">${esc(bits.join("  ·  "))}</div></td>`;
+}
+
+function kalshiCell(k) {
+  const bits = [];
+  if (k.ticker) bits.push(k.ticker);
+  if (k.date) bits.push(k.date);
+  if (k.yes != null || k.no != null) bits.push(`Yes ${cents(k.yes)} / No ${cents(k.no)}`);
+  if (k.volume != null) bits.push(vol(k.volume) + " vol");
+  return `<td class="title">${esc(k.title)}<div class="meta">${esc(bits.join("  ·  "))}</div></td>`;
+}
+
+function legChip(l) {
+  return `<span class="chip">Buy <b>${esc(l.side)}</b> on ${esc(l.platform)} @ <b>${cents(l.price)}</b>` +
+         (l.size != null ? ` <span style="color:var(--muted)">×${qty(l.size)}</span>` : "") + `</span>`;
+}
+
+function emptyState(big, small) {
+  return `<div class="panel"><div class="empty"><div class="big">${esc(big)}</div>${esc(small)}</div></div>`;
+}
+
+function matchesFilter(row, q) {
+  if (!q) return true;
+  return JSON.stringify(row).toLowerCase().includes(q);
+}
+
+function renderArbs(q) {
+  const el = $("#view-arbs");
+  if (!DATA) { el.innerHTML = emptyState("No results yet", "Press “Run scan” to fetch markets and find arbitrage."); return; }
+  const rows = DATA.arbs.filter(r => matchesFilter(r, q));
+  if (!rows.length) {
+    el.innerHTML = emptyState(q ? "No arbitrage rows match your filter" : "No arbitrage opportunities found",
+      q ? "" : "Every matched pair currently prices above $1.00 combined.");
+    return;
+  }
+  el.innerHTML = `<div class="panel"><table>
+    <thead><tr>
+      <th class="num">#</th><th class="num">Profit</th><th>Strategy</th>
+      <th>Polymarket</th><th>Kalshi</th>
+      <th class="num">Max contracts</th><th>Expires</th>
+    </tr></thead><tbody>` +
+    rows.map((a, i) => `<tr>
+      <td class="num" style="color:var(--muted)">${i + 1}</td>
+      <td class="num profit">${pct(a.margin)}</td>
+      <td>${a.legs.map(legChip).join("<br>")}
+        <div class="meta">combined cost ${cents(a.prob_sum)} per $1 payout</div></td>
+      ${polyCell(a.poly)}
+      ${kalshiCell(a.kalshi)}
+      <td class="num">${qty(a.max_contracts)}</td>
+      <td style="white-space:nowrap">${esc(a.expiration || "—")}${a.live ? '<br><span class="badge-live">LIVE — expires today</span>' : ""}</td>
+    </tr>`).join("") + `</tbody></table></div>`;
+}
+
+function renderMatchTable(el, list, scoreLabel, q, emptyMsg) {
+  if (!DATA) { el.innerHTML = emptyState("No results yet", "Press “Run scan” to fetch markets."); return; }
+  const rows = list.filter(r => matchesFilter(r, q));
+  if (!rows.length) { el.innerHTML = emptyState(q ? "No rows match your filter" : emptyMsg, ""); return; }
+  el.innerHTML = `<div class="panel"><table>
+    <thead><tr>
+      <th class="num">#</th><th class="num">${esc(scoreLabel)}</th>
+      <th>Polymarket</th><th>Kalshi</th><th>Shared keywords</th>
+    </tr></thead><tbody>` +
+    rows.map((m, i) => `<tr>
+      <td class="num" style="color:var(--muted)">${i + 1}</td>
+      <td class="num"><span class="score-chip">${Math.round(m.score * 100)}%</span></td>
+      ${polyCell(m.poly)}
+      ${kalshiCell(m.kalshi)}
+      <td style="max-width:240px;color:var(--ink-2);font-size:12.5px">${esc((m.shared || []).join(", ") || "—")}</td>
+    </tr>`).join("") + `</tbody></table></div>`;
+}
+
+function renderAll() {
+  const q = $("#filter").value.trim().toLowerCase();
+  renderTiles();
+  renderArbs(q);
+  renderMatchTable($("#view-verified"), DATA ? DATA.verified : [], "Confidence", q,
+    "No LLM-verified matches (set ANTHROPIC_API_KEY to enable verification)");
+  renderMatchTable($("#view-matches"), DATA ? DATA.matches : [], "Similarity", q,
+    "No TF-IDF matches found");
+  if (DATA) {
+    $("#cArbs").textContent = DATA.summary.arbs;
+    $("#cVerified").textContent = DATA.summary.verified;
+    $("#cMatches").textContent = DATA.summary.matches;
+    $("#generatedAt").textContent = "last scan " +
+      new Date(DATA.generated_at).toLocaleString();
+  }
+}
+
+function setTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll("nav.tabs button").forEach(b =>
+    b.classList.toggle("active", b.dataset.tab === tab));
+  document.querySelectorAll(".view").forEach(v => v.classList.add("hidden"));
+  $("#view-" + tab).classList.remove("hidden");
+  $("#filterBar").classList.toggle("hidden", tab === "log");
+}
+
+async function loadResults() {
+  try {
+    const r = await fetch("/api/results");
+    if (r.ok) { DATA = await r.json(); renderAll(); }
+    else renderAll();
+  } catch { renderAll(); }
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/status");
+    const s = await r.json();
+    $("#statusDot").className = "dot" + (s.running ? " running" : "");
+    $("#statusText").textContent = s.running
+      ? "Scanning…" : (s.llm_enabled ? "Idle" : "Idle · LLM check off (no API key)");
+    $("#runBtn").disabled = s.running;
+    if (s.log && s.log.length) {
+      const pre = $("#log");
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
+      pre.textContent = s.log.join("\n");
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    }
+    const banner = $("#errorBanner");
+    if (s.error) {
+      banner.textContent = "Scan failed: " + s.error;
+      banner.classList.remove("hidden");
+    } else banner.classList.add("hidden");
+
+    if (!s.running && polling) {
+      clearInterval(polling); polling = null;
+      await loadResults();
+    }
+  } catch { /* server briefly unreachable */ }
+}
+
+$("#runBtn").addEventListener("click", async () => {
+  const r = await fetch("/api/run", { method: "POST" });
+  if (r.ok) {
+    setTab("log");
+    $("#log").textContent = "";
+    if (!polling) polling = setInterval(poll, 1000);
+    poll();
+  }
+});
+
+document.querySelectorAll("nav.tabs button").forEach(b =>
+  b.addEventListener("click", () => setTab(b.dataset.tab)));
+$("#filter").addEventListener("input", renderAll);
+
+loadResults();
+poll();
+</script>
+</body>
+</html>
