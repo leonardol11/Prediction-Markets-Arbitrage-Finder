@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.xlsx
+.DS_Store
+
+# Cached last scan, so a restart keeps your results
+.cache/
+.gstack/

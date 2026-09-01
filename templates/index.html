@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prediction Market Arbitrage Finder</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%93%88%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <h1>Arbitrage Finder</h1>
+      <p>Polymarket <span class="x">×</span> Kalshi</p>
+    </div>
+  </div>
+
+  <div class="topbar-status">
+    <span id="status-pill" class="pill pill-idle">Idle</span>
+    <span id="status-detail" class="status-detail"></span>
+  </div>
+
+  <div class="topbar-actions">
+    <button id="theme-toggle" class="btn btn-ghost btn-icon" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <button id="settings-toggle" class="btn btn-ghost">Settings</button>
+    <button id="download-btn" class="btn btn-ghost" disabled>Download .xlsx</button>
+    <button id="run-btn" class="btn btn-primary">Run scan</button>
+    <button id="cancel-btn" class="btn btn-danger" hidden>Stop</button>
+  </div>
+</header>
+
+<div id="progress-track" class="progress-track" hidden><div id="progress-bar"></div></div>
+
+<section id="settings" class="settings" hidden>
+  <div class="settings-grid">
+    <label class="field">
+      <span>Min volume ($)</span>
+      <input id="min_volume" type="number" min="0" step="1000" value="{{ defaults.min_volume }}">
+      <small>Ignore markets thinner than this on either venue.</small>
+    </label>
+    <label class="field">
+      <span>Resolves before</span>
+      <input id="cutoff" type="date" value="{{ defaults.cutoff }}">
+      <small>Only markets settling before this date.</small>
+    </label>
+    <label class="field">
+      <span>Similarity threshold</span>
+      <input id="similarity" type="number" min="0.1" max="0.95" step="0.05" value="{{ defaults.similarity }}">
+      <small>Lower finds more pairs — and more false ones.</small>
+    </label>
+    <label class="field">
+      <span>Min edge (%)</span>
+      <input id="min_margin" type="number" min="0" max="99" step="0.5" value="{{ (defaults.min_margin * 100) | round(2) }}">
+      <small>Hide arbs below this profit per $1 pair.</small>
+    </label>
+    <label class="field">
+      <span>LLM confidence</span>
+      <input id="confidence" type="number" min="0" max="1" step="0.05" value="{{ defaults.confidence }}">
+      <small>Cutoff for keeping an LLM-confirmed pair.</small>
+    </label>
+    <label class="field field-wide">
+      <span>Groq API key</span>
+      <input id="groq_api_key" type="password" autocomplete="off"
+             placeholder="{% if has_env_key %}Using GROQ_API_KEY from the environment{% else %}gsk_… (optional — leave blank to skip LLM checking){% endif %}">
+      <small>Stored only in this browser. Free keys: <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a></small>
+    </label>
+    <label class="field field-check">
+      <input id="use_llm" type="checkbox" checked>
+      <span>Verify matches with an LLM ({{ defaults.model }})</span>
+    </label>
+  </div>
+</section>
+
+<section id="summary" class="summary" hidden></section>
+
+<main class="workbook">
+  <nav id="tabs" class="tabs" role="tablist" hidden></nav>
+
+  <div class="sheet-toolbar" id="sheet-toolbar" hidden>
+    <div class="sheet-hint" id="sheet-hint"></div>
+    <div class="toolbar-right">
+      <input id="filter" type="search" placeholder="Filter rows…" autocomplete="off">
+      <span id="row-count" class="row-count"></span>
+      <button id="copy-btn" class="btn btn-ghost btn-sm">Copy CSV</button>
+    </div>
+  </div>
+
+  <div id="grid-wrap" class="grid-wrap">
+    <div id="empty-state" class="empty">
+      <h2>Find the same question priced twice</h2>
+      <p>When Polymarket and Kalshi list the same event, YES on one venue and NO
+         on the other sometimes cost less than $1.00 together — and exactly one
+         of them pays out $1.00.</p>
+      <ol class="steps">
+        <li><b>Fetch</b><span>Every liquid market on both venues, filtered by volume and resolution date.</span></li>
+        <li><b>Match</b><span>Question text is paired by similarity, then confirmed by an LLM.</span></li>
+        <li><b>Price</b><span>Live best asks from the Polymarket CLOB and Kalshi orderbooks.</span></li>
+      </ol>
+      <p class="empty-cta" id="empty-cta">Press <strong>Run scan</strong> to start. The first
+         pass takes a few minutes — Kalshi has no volume filter, so every open
+         market has to be walked.</p>
+    </div>
+    <table id="grid" class="grid" hidden>
+      <thead><tr id="grid-head"></tr></thead>
+      <tbody id="grid-body"></tbody>
+    </table>
+    <div id="sentinel"></div>
+  </div>
+</main>
+
+<section id="console" class="console" hidden>
+  <div class="console-head">
+    <span>Scan log</span>
+    <button id="console-toggle" class="btn btn-ghost btn-sm">Hide</button>
+  </div>
+  <pre id="console-body" class="console-body"></pre>
+</section>
+
+<footer class="footer">
+  <span>Prices are live best asks from the Polymarket CLOB and the Kalshi orderbook.</span>
+  <span>Edges are gross — fees, slippage and settlement risk are yours to model.</span>
+</footer>
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
