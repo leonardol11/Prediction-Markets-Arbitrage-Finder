@@ -1,0 +1,9 @@
+.venv/
+venv/
+.env
+.cache/
+.gstack/
+__pycache__/
+*.pyc
+*.xlsx
+tests/

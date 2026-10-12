@@ -16,6 +16,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import copy
 from datetime import datetime, timezone
 
 import numpy as np
@@ -903,6 +904,7 @@ class ScanResult:
         self.config = cfg
         self.started_at = datetime.now(timezone.utc)
         self.finished_at = None
+        self.prices_updated_at = None
         self.poly = []
         self.kalshi = []
         self.matches = []
@@ -958,6 +960,8 @@ def run_scan(cfg: ScanConfig, rep: Reporter = None) -> ScanResult:
             f"Kalshi markets need books")
     res.poly_ob, res.kalshi_ob = fetch_all_orderbooks(
         res.matched_poly, res.matched_kalshi, cfg, rep)
+    if res.poly_ob or res.kalshi_ob:
+        res.prices_updated_at = datetime.now(timezone.utc)
     rep.check_cancelled()
 
     rep.step(5, "Arbitrage scan")
@@ -969,3 +973,22 @@ def run_scan(cfg: ScanConfig, rep: Reporter = None) -> ScanResult:
             f"{len(res.matches):,} matches, {len(res.verified):,} verified, "
             f"{len(res.arbs):,} arbs")
     return res
+
+
+def refresh_scan(result: ScanResult, rep: Reporter = None) -> ScanResult:
+    """Reprice existing matches without mutating the published discovery snapshot."""
+    rep = rep or Reporter()
+    if not result.matched_poly and not result.matched_kalshi:
+        raise RuntimeError("No matched markets to refresh. Run a new full scan.")
+    # Keep market dictionaries shared: matching and sheet builders map them by id.
+    refreshed = copy(result)
+    refreshed.poly_ob, refreshed.kalshi_ob = fetch_all_orderbooks(
+        result.matched_poly, result.matched_kalshi, result.config, rep)
+    if not refreshed.poly_ob and not refreshed.kalshi_ob:
+        raise RuntimeError("No live orderbooks were available. Previous results were retained.")
+    refreshed.prices_updated_at = datetime.now(timezone.utc)
+    source = result.verified or result.matches
+    refreshed.arbs = find_arbitrage(
+        source, result.matched_poly, result.matched_kalshi,
+        refreshed.poly_ob, refreshed.kalshi_ob, result.config, rep)
+    return refreshed

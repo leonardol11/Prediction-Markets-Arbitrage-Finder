@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%93%88%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M7 22l7-10 5 5 6-10' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
 </head>
 <body>
 
@@ -16,26 +16,49 @@
   <div class="brand">
     <span class="brand-mark" aria-hidden="true"></span>
     <div>
-      <h1>Arbitrage Finder</h1>
-      <p>Polymarket <span class="x">×</span> Kalshi</p>
+      <h1>Market arbitrage dashboard</h1>
+      <p><span class="venue">Polymarket</span><span class="x" aria-hidden="true"> / </span><span class="venue">Kalshi</span></p>
     </div>
   </div>
 
-  <div class="topbar-status">
+  <div class="topbar-status" role="status" aria-live="polite">
     <span id="status-pill" class="pill pill-idle">Idle</span>
     <span id="status-detail" class="status-detail"></span>
   </div>
 
   <div class="topbar-actions">
     <button id="theme-toggle" class="btn btn-ghost btn-icon" title="Toggle theme" aria-label="Toggle theme">◐</button>
-    <button id="settings-toggle" class="btn btn-ghost">Settings</button>
+    <button id="settings-toggle" class="btn btn-ghost" aria-controls="settings" aria-expanded="false">Settings</button>
     <button id="download-btn" class="btn btn-ghost" disabled>Download .xlsx</button>
-    <button id="run-btn" class="btn btn-primary">Run scan</button>
+    <button id="run-btn" class="btn btn-primary" aria-describedby="discovery-note" disabled>Run scan</button>
     <button id="cancel-btn" class="btn btn-danger" hidden>Stop</button>
   </div>
 </header>
 
 <div id="progress-track" class="progress-track" hidden><div id="progress-bar"></div></div>
+
+<section class="live-panel" aria-label="Live market refresh">
+  <div class="live-controls">
+    <div class="live-heading">
+      <span id="live-indicator" class="live-indicator" aria-hidden="true"></span>
+      <div><h2>Live price monitor</h2><p>Matched orderbooks · every 30 seconds</p></div>
+    </div>
+    <div class="refresh-actions">
+      <label class="auto-refresh-label" for="auto-refresh">
+        <input id="auto-refresh" type="checkbox" checked>
+        <span>Auto refresh <span class="refresh-interval">30s</span></span>
+      </label>
+      <span id="refresh-countdown" class="refresh-countdown">Connecting…</span>
+      <button id="refresh-btn" class="btn btn-ghost" disabled>Refresh now</button>
+    </div>
+  </div>
+  <div class="snapshot-times">
+    <span>Prices updated <time id="prices-updated">Not yet</time></span>
+    <span>Markets discovered <time id="discovery-updated">Not yet</time></span>
+  </div>
+  <p id="live-message" class="live-message" role="status" aria-live="polite">Run a full scan to discover matching markets and enable live prices.</p>
+  <p id="discovery-note" class="discovery-note">Run scan discovers new markets and matches; it can take a few minutes. Live refresh only reprices matched orderbooks and recalculates arbitrage. Raw market tabs remain discovery snapshots.{% if scan_time_limit %} This server stops scans after {{ scan_time_limit }}s; a sooner <b>Resolves before</b> date or a higher minimum volume keeps scans inside that limit.{% endif %}</p>
+</section>
 
 <section id="settings" class="settings" hidden>
   <div class="settings-grid">
@@ -80,18 +103,18 @@
 <section id="summary" class="summary" hidden></section>
 
 <main class="workbook">
-  <nav id="tabs" class="tabs" role="tablist" hidden></nav>
+  <nav id="tabs" class="tabs" role="tablist" aria-label="Market data sheets" hidden></nav>
 
   <div class="sheet-toolbar" id="sheet-toolbar" hidden>
     <div class="sheet-hint" id="sheet-hint"></div>
     <div class="toolbar-right">
-      <input id="filter" type="search" placeholder="Filter rows…" autocomplete="off">
+      <input id="filter" type="search" placeholder="Filter rows…" aria-label="Filter active sheet rows" autocomplete="off">
       <span id="row-count" class="row-count"></span>
       <button id="copy-btn" class="btn btn-ghost btn-sm">Copy CSV</button>
     </div>
   </div>
 
-  <div id="grid-wrap" class="grid-wrap">
+  <div id="grid-wrap" class="grid-wrap" role="region" aria-label="Market results" tabindex="0">
     <div id="empty-state" class="empty">
       <h2>Find the same question priced twice</h2>
       <p>When Polymarket and Kalshi list the same event, YES on one venue and NO
@@ -99,14 +122,15 @@
          of them pays out $1.00.</p>
       <ol class="steps">
         <li><b>Fetch</b><span>Every liquid market on both venues, filtered by volume and resolution date.</span></li>
-        <li><b>Match</b><span>Question text is paired by similarity, then confirmed by an LLM.</span></li>
-        <li><b>Price</b><span>Live best asks from the Polymarket CLOB and Kalshi orderbooks.</span></li>
+        <li><b>Match</b><span>Question text is paired by similarity, with optional LLM verification.</span></li>
+        <li><b>Monitor</b><span>Matched orderbooks refresh every 30 seconds while this page stays open.</span></li>
       </ol>
       <p class="empty-cta" id="empty-cta">Press <strong>Run scan</strong> to start. The first
          pass takes a few minutes — Kalshi has no volume filter, so every open
          market has to be walked.</p>
+      <button id="empty-run-btn" class="btn btn-primary empty-run-btn" disabled>Run scan</button>
     </div>
-    <table id="grid" class="grid" hidden>
+    <table id="grid" class="grid" aria-label="Active market data sheet" hidden>
       <thead><tr id="grid-head"></tr></thead>
       <tbody id="grid-body"></tbody>
     </table>
@@ -123,7 +147,7 @@
 </section>
 
 <footer class="footer">
-  <span>Prices are live best asks from the Polymarket CLOB and the Kalshi orderbook.</span>
+  <span>Price snapshots: Polymarket CLOB and Kalshi orderbooks. Auto refresh runs while this page is open.</span>
   <span>Edges are gross — fees, slippage and settlement risk are yours to model.</span>
 </footer>
 

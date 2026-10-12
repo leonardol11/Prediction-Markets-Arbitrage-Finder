@@ -2,164 +2,208 @@
 
     python3 app.py            # then open http://127.0.0.1:5000
 
-One scan runs at a time. The browser starts it, streams the log over
-Server-Sent Events, then renders the finished sheets and can download the
-same data as a styled .xlsx workbook.
+The server keeps no state between requests, so it runs the same way locally
+and as a serverless function on Vercel:
+
+  POST /api/scan      runs one scan inside the request and streams its log as
+                      Server-Sent Events; the final event carries the sheets
+                      plus a compact repricing context.
+  POST /api/refresh   reprices that context and returns the repriced sheets.
+  POST /api/workbook  turns the displayed sheets into a styled .xlsx file.
+
+The browser keeps the last finished scan, so a page reload brings it back.
+Large request bodies may be gzip-compressed and flagged with the
+X-Content-Encoding header, which keeps them under Vercel's request size limit.
 """
 
-import io
 import json
 import os
 import queue
 import threading
-import uuid
+import time
 import webbrowser
+import zlib
 from datetime import datetime, timezone
 
-from flask import (Flask, Response, jsonify, render_template, request,
-                   send_file, stream_with_context)
+from flask import Flask, Response, jsonify, render_template, request
 
-from matcher import (Cancelled, Reporter, ScanConfig, TOTAL_STEPS, build_sheets,
-                     build_summary, parse_cutoff, run_scan, workbook_bytes)
+from matcher import (Cancelled, Reporter, ScanConfig, ScanResult, TOTAL_STEPS,
+                     build_sheets, build_summary, parse_cutoff, refresh_scan,
+                     run_scan, workbook_bytes)
 
-app = Flask(__name__)
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Assets live in public/ so Vercel serves them from its CDN; Flask serves the
+# same folder at the same URL when running locally.
+app = Flask(__name__, static_folder=os.path.join(ROOT, "public", "static"),
+            static_url_path="/static")
 app.config["JSON_SORT_KEYS"] = False
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
 
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
-CACHE_FILE = os.path.join(CACHE_DIR, "last_scan.json")
-
-_lock = threading.Lock()
-_jobs = {}
-_latest_done = None          # job id of the most recent successful scan
+MAX_INFLATED_BYTES = 256 * 1024 * 1024
+REPRICED_SHEETS = ("arbitrage", "verified", "matches")
+CONTEXT_VERSION = 2
 
 
-class Job:
-    """One scan: its live log, its progress, and its finished sheets."""
+def _scan_time_limit() -> float:
+    """Seconds a scan may run before it stops itself; 0 means no limit.
 
-    def __init__(self, cfg: ScanConfig):
-        self.id = uuid.uuid4().hex[:12]
-        self.config = cfg
-        self.status = "running"           # running | done | error | cancelled
-        self.created_at = datetime.now(timezone.utc)
-        self.logs = []
-        self.step = 0
-        self.step_label = "Starting…"
-        self.step_pct = None
-        self.error = None
-        self.sheets = None
-        self.summary = None
-        self._xlsx = None
-        self._cancel = threading.Event()
-        self._subscribers = []
-        self._sub_lock = threading.Lock()
-
-    # ── event fan-out ────────────────────────────────────────────────────────
-    def subscribe(self) -> queue.Queue:
-        q = queue.Queue()
-        with self._sub_lock:
-            self._subscribers.append(q)
-        return q
-
-    def unsubscribe(self, q):
-        with self._sub_lock:
-            if q in self._subscribers:
-                self._subscribers.remove(q)
-
-    def _emit(self, event: str, data: dict):
-        payload = (event, data)
-        with self._sub_lock:
-            for q in list(self._subscribers):
-                q.put(payload)
-
-    # ── reporter hooks ───────────────────────────────────────────────────────
-    def on_log(self, message: str):
-        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        line = {"t": stamp, "m": message}
-        self.logs.append(line)
-        del self.logs[:-600]
-        self._emit("log", line)
-
-    def on_progress(self, step: int, label: str, pct=None):
-        self.step, self.step_label, self.step_pct = step, label, pct
-        self._emit("progress", {"step": step, "total": TOTAL_STEPS,
-                                "label": label, "pct": pct})
-
-    def cancel(self):
-        self._cancel.set()
-
-    @property
-    def cancelled(self) -> bool:
-        return self._cancel.is_set()
-
-    def state(self) -> dict:
-        return {
-            "id": self.id, "status": self.status,
-            "step": self.step, "total": TOTAL_STEPS,
-            "label": self.step_label, "pct": self.step_pct,
-            "error": self.error,
-        }
-
-    def xlsx(self) -> bytes:
-        if self._xlsx is None and self.sheets:
-            self._xlsx = workbook_bytes(self.sheets)
-        return self._xlsx
+    Vercel kills a function at its max duration (300s on Hobby, configured in
+    vercel.json). Stopping a little earlier lets the scan report a clear error
+    instead of the connection dropping mid-stream.
+    """
+    raw = os.environ.get("SCAN_TIME_LIMIT")
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 270.0 if os.environ.get("VERCEL") else 0.0
 
 
-def _save_cache(job: Job):
-    """Keep the last finished scan on disk so a restart doesn't lose it."""
+# ─────────────────────────────── request helpers ──────────────────────────────
+
+class BadRequest(ValueError):
+    pass
+
+
+def _json_body() -> dict:
+    raw = request.get_data(cache=False)
+    if request.headers.get("X-Content-Encoding", "").lower() == "gzip":
+        inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        try:
+            raw = inflater.decompress(raw, MAX_INFLATED_BYTES)
+        except zlib.error as exc:
+            raise BadRequest(f"Invalid gzip body: {exc}") from exc
+        if inflater.unconsumed_tail:
+            raise BadRequest("Request body is too large.")
+    if not raw:
+        return {}
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        tmp = CACHE_FILE + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump({"id": job.id, "summary": job.summary, "sheets": job.sheets}, fh)
-        os.replace(tmp, CACHE_FILE)
-    except OSError as exc:
-        job.on_log(f"  (could not cache results: {exc})")
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise BadRequest("Request body is not valid JSON.") from exc
+    if not isinstance(data, dict):
+        raise BadRequest("Request body must be a JSON object.")
+    return data
 
 
-def _load_cache():
-    """Re-register the last finished scan as a job so every route just works."""
-    global _latest_done
+@app.errorhandler(BadRequest)
+def _bad_request(exc):
+    return jsonify({"error": str(exc)}), 400
+
+
+@app.errorhandler(413)
+def _too_large(_exc):
+    return jsonify({"error": "Request body is too large."}), 413
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+# ─────────────────────────────── repricing context ────────────────────────────
+
+def _serialize_context(result: ScanResult) -> dict:
+    """Everything refresh needs, and nothing more.
+
+    Only markets referenced by a pair are kept, so the context stays small
+    enough for the browser to send back. API keys are never included.
+    """
+    poly, kalshi, p_ix, k_ix = [], [], {}, {}
+
+    def add(m, markets, index):
+        if id(m) not in index:
+            index[id(m)] = len(markets)
+            markets.append(m)
+        return index[id(m)]
+
+    def pairs(rows):
+        return [[add(p, poly, p_ix), add(k, kalshi, k_ix), sorted(shared), score]
+                for p, k, shared, score in rows]
+
+    matches, verified = pairs(result.matches), pairs(result.verified)
+    matched_poly = [add(m, poly, p_ix) for m in result.matched_poly]
+    matched_kalshi = [add(m, kalshi, k_ix) for m in result.matched_kalshi]
+    cfg = result.config
+    return {
+        "version": CONTEXT_VERSION,
+        "config": {
+            "min_volume": cfg.min_volume,
+            "cutoff_date": cfg.cutoff_date.isoformat(),
+            "match_display_threshold": cfg.match_display_threshold,
+            "groq_confidence_cutoff": cfg.groq_confidence_cutoff,
+            "min_margin": cfg.min_margin,
+            "orderbook_workers": cfg.orderbook_workers,
+        },
+        "poly": poly, "kalshi": kalshi,
+        "poly_count": len(result.poly), "kalshi_count": len(result.kalshi),
+        "matches": matches, "verified": verified,
+        "matched_poly": matched_poly, "matched_kalshi": matched_kalshi,
+        "started_at": result.started_at.isoformat(),
+        "finished_at": (result.finished_at or result.started_at).isoformat(),
+        "prices_updated_at": (
+            result.prices_updated_at.isoformat() if result.prices_updated_at else None),
+        "arb_source_label": result.arb_source_label, "llm_used": result.llm_used,
+    }
+
+
+def _restore_context(data):
+    if not isinstance(data, dict) or data.get("version") != CONTEXT_VERSION:
+        raise BadRequest("This snapshot can't be repriced. Run a new full scan.")
     try:
-        with open(CACHE_FILE) as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return
-    job = Job(ScanConfig())
-    job.id = data.get("id") or job.id
-    job.status = "done"
-    job.summary = data.get("summary")
-    job.sheets = data.get("sheets")
-    if not job.sheets:
-        return
-    _jobs[job.id] = job
-    _latest_done = job.id
+        settings = data["config"]
+        cfg = ScanConfig(
+            min_volume=float(settings["min_volume"]),
+            cutoff_date=datetime.fromisoformat(settings["cutoff_date"]),
+            match_display_threshold=float(settings["match_display_threshold"]),
+            groq_confidence_cutoff=float(settings["groq_confidence_cutoff"]),
+            min_margin=float(settings["min_margin"]),
+            orderbook_workers=max(1, min(int(settings["orderbook_workers"]), 128)),
+            use_llm=False,
+        )
+        # Refresh never calls Groq, even when the environment supplies a key.
+        cfg.groq_api_key = ""
+        result = ScanResult(cfg)
+        result.poly, result.kalshi = list(data["poly"]), list(data["kalshi"])
+        if not all(isinstance(m, dict) for m in result.poly + result.kalshi):
+            raise ValueError("Invalid cached market")
+
+        def market(markets, index):
+            if type(index) is not int or not 0 <= index < len(markets):
+                raise ValueError("Invalid cached market reference")
+            return markets[index]
+
+        def pairs(rows):
+            return [(market(result.poly, pi), market(result.kalshi, ki),
+                     set(shared), float(score))
+                    for pi, ki, shared, score in rows]
+
+        result.matches, result.verified = pairs(data["matches"]), pairs(data["verified"])
+        result.matched_poly = [market(result.poly, i) for i in data["matched_poly"]]
+        result.matched_kalshi = [market(result.kalshi, i) for i in data["matched_kalshi"]]
+        result.started_at = datetime.fromisoformat(data["started_at"])
+        result.finished_at = datetime.fromisoformat(data["finished_at"])
+        stamp = data.get("prices_updated_at")
+        result.prices_updated_at = datetime.fromisoformat(stamp) if stamp else None
+        result.arb_source_label = str(data["arb_source_label"])
+        result.llm_used = bool(data["llm_used"])
+        counts = int(data["poly_count"]), int(data["kalshi_count"])
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError) as exc:
+        raise BadRequest(f"Invalid repricing context: {exc}") from exc
+    return result, counts
 
 
-def _run_job(job: Job):
-    global _latest_done
-    rep = Reporter(on_log=job.on_log, on_progress=job.on_progress,
-                   should_cancel=lambda: job.cancelled)
-    try:
-        result = run_scan(job.config, rep)
-        job.sheets = build_sheets(result)
-        job.summary = build_summary(result)
-        job.status = "done"
-        with _lock:
-            _latest_done = job.id
-        _save_cache(job)
-        job._emit("done", {"summary": job.summary})
-    except Cancelled:
-        job.status = "cancelled"
-        job.on_log("Scan cancelled.")
-        job._emit("cancelled", {})
-    except Exception as exc:                     # surface the failure in the UI
-        job.status = "error"
-        job.error = f"{type(exc).__name__}: {exc}"
-        job.on_log(f"✕ {job.error}")
-        job._emit("scan_error", {"error": job.error})
-    finally:
-        job._emit("end", {"status": job.status})
+def _payload(result: ScanResult, sheets, summary) -> dict:
+    stamp = result.prices_updated_at
+    return {
+        "status": "done",
+        "summary": summary,
+        "sheets": sheets,
+        "prices_updated_at": stamp.isoformat() if stamp else None,
+        "refresh_available": bool(result.matched_poly or result.matched_kalshi),
+        "context": _serialize_context(result),
+    }
 
 
 # ─────────────────────────────────── routes ───────────────────────────────────
@@ -167,6 +211,7 @@ def _run_job(job: Job):
 @app.get("/")
 def index():
     defaults = ScanConfig()
+    limit = _scan_time_limit()
     return render_template(
         "index.html",
         defaults={
@@ -178,6 +223,7 @@ def index():
             "model": defaults.groq_model,
         },
         has_env_key=bool(os.environ.get("GROQ_API_KEY")),
+        scan_time_limit=int(limit),
     )
 
 
@@ -206,116 +252,120 @@ def _config_from_request(body: dict) -> ScanConfig:
 
 
 @app.post("/api/scan")
-def start_scan():
-    body = request.get_json(silent=True) or {}
-    with _lock:
-        running = [j for j in _jobs.values() if j.status == "running"]
-        if running:
-            return jsonify({"error": "A scan is already running.",
-                            "id": running[0].id}), 409
+def scan():
+    """Run a scan for the lifetime of this request, streaming its progress."""
+    body = _json_body()
+    try:
+        cfg = _config_from_request(body)
+    except ValueError as exc:
+        return jsonify({"error": f"Invalid settings: {exc}"}), 400
+
+    events = queue.Queue()
+    stop = threading.Event()
+    limit = _scan_time_limit()
+    deadline = time.monotonic() + limit if limit else None
+
+    def timed_out() -> bool:
+        return deadline is not None and time.monotonic() > deadline
+
+    def on_log(message):
+        events.put(("log", {"t": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                            "m": message}))
+
+    def on_progress(step, label, pct=None):
+        events.put(("progress", {"step": step, "total": TOTAL_STEPS,
+                                 "label": label, "pct": pct}))
+
+    def work():
+        status = "error"
+        rep = Reporter(on_log=on_log, on_progress=on_progress,
+                       should_cancel=lambda: stop.is_set() or timed_out())
         try:
-            cfg = _config_from_request(body)
-        except ValueError as exc:
-            return jsonify({"error": f"Invalid settings: {exc}"}), 400
-        job = Job(cfg)
-        _jobs[job.id] = job
-        for old in sorted(_jobs.values(), key=lambda j: j.created_at)[:-6]:
-            _jobs.pop(old.id, None)
+            result = run_scan(cfg, rep)
+            payload = _payload(result, build_sheets(result), build_summary(result))
+            events.put(("done", payload))
+            status = "done"
+        except Cancelled:
+            if timed_out():
+                error = (f"The scan hit the {int(limit)}s server time limit. "
+                         "Try a sooner 'Resolves before' date or a higher minimum "
+                         "volume, or raise the limit (see README).")
+                on_log(f"✕ {error}")
+                events.put(("scan_error", {"error": error}))
+            else:
+                status = "cancelled"
+                on_log("Scan cancelled.")
+                events.put(("cancelled", {}))
+        except Exception as exc:                 # surface the failure in the UI
+            error = f"{type(exc).__name__}: {exc}"
+            on_log(f"✕ {error}")
+            events.put(("scan_error", {"error": error}))
+        finally:
+            events.put(("end", {"status": status}))
 
-    threading.Thread(target=_run_job, args=(job,), daemon=True).start()
-    return jsonify({"id": job.id, "llm_enabled": cfg.llm_enabled})
-
-
-@app.post("/api/scan/<job_id>/cancel")
-def cancel_scan(job_id):
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Unknown scan."}), 404
-    job.cancel()
-    return jsonify(job.state())
-
-
-@app.get("/api/scan/<job_id>/stream")
-def stream(job_id):
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Unknown scan."}), 404
-
-    def gen():
-        q = job.subscribe()
+    def stream():
+        threading.Thread(target=work, daemon=True).start()
         try:
-            yield _sse("state", job.state())
-            for line in job.logs[-200:]:
-                yield _sse("log", line)
-            if job.status != "running":
-                yield _sse("end", {"status": job.status})
-                return
+            yield _sse("start", {"total": TOTAL_STEPS, "llm_enabled": cfg.llm_enabled,
+                                 "time_limit": int(limit)})
             while True:
                 try:
-                    event, data = q.get(timeout=15)
+                    event, data = events.get(timeout=10)
                 except queue.Empty:
-                    yield ": ping\n\n"
+                    yield ": ping\n\n"           # keeps proxies from closing the stream
                     continue
                 yield _sse(event, data)
                 if event == "end":
                     return
         finally:
-            job.unsubscribe(q)
+            # Runs when the browser disconnects too, so an abandoned scan stops.
+            stop.set()
 
-    return Response(stream_with_context(gen()), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache",
-                             "X-Accel-Buffering": "no",
-                             "Connection": "keep-alive"})
-
-
-def _sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    return Response(stream(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache, no-transform",
+                             "X-Accel-Buffering": "no"})
 
 
-@app.get("/api/scan/<job_id>/results")
-def results(job_id):
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Unknown scan."}), 404
-    if job.status == "running":
-        return jsonify({"status": "running", **job.state()}), 202
-    if not job.sheets:
-        return jsonify({"status": job.status, "error": job.error}), 200
-    return jsonify({"status": job.status, "summary": job.summary,
-                    "sheets": job.sheets})
+@app.post("/api/refresh")
+def refresh():
+    body = _json_body()
+    result, (poly_count, kalshi_count) = _restore_context(body.get("context"))
+    try:
+        refreshed = refresh_scan(result, Reporter(on_log=lambda _m: None))
+    except Exception as exc:
+        return jsonify({"error": f"Price refresh failed: {exc}"}), 502
+    sheets = [s for s in build_sheets(refreshed) if s["key"] in REPRICED_SHEETS]
+    summary = build_summary(refreshed)
+    summary.update(poly_count=poly_count, kalshi_count=kalshi_count)
+    payload = _payload(refreshed, sheets, summary)
+    payload["context"].update(poly_count=poly_count, kalshi_count=kalshi_count)
+    return jsonify(payload)
 
 
-@app.get("/api/current")
-def current():
-    """Lets a reloaded page reattach to a scan that is still running."""
-    job = next((j for j in _jobs.values() if j.status == "running"), None)
-    return jsonify({"id": job.id, **job.state()} if job else {"id": None})
+@app.post("/api/workbook")
+def workbook():
+    body = _json_body()
+    sheets = body.get("sheets")
+    if not isinstance(sheets, list) or not sheets:
+        raise BadRequest("No results to download.")
+    try:
+        content = workbook_bytes(sheets)
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError) as exc:
+        raise BadRequest(f"Invalid sheet data: {exc}") from exc
+    stamp = str(body.get("stamp") or "")[:10]
+    stamp = stamp if stamp.replace("-", "").isdigit() else "results"
 
+    def chunks(size=256 * 1024):
+        # Streamed so large workbooks aren't held to the buffered response limit.
+        for i in range(0, len(content), size):
+            yield content[i:i + size]
 
-@app.get("/api/latest")
-def latest():
-    job = _jobs.get(_latest_done)
-    if not job or not job.sheets:
-        return jsonify({"status": "empty"})
-    return jsonify({"status": "done", "id": job.id,
-                    "summary": job.summary, "sheets": job.sheets})
-
-
-@app.get("/api/scan/<job_id>/download")
-def download(job_id):
-    job = _jobs.get(job_id)
-    if not job or not job.sheets:
-        return jsonify({"error": "No results to download."}), 404
-    stamp = (job.summary or {}).get("finished_at", "")[:10] or "results"
-    return send_file(
-        io.BytesIO(job.xlsx()),
+    return Response(
+        chunks(),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        as_attachment=True,
-        download_name=f"market-arbitrage-{stamp}.xlsx",
+        headers={"Content-Disposition":
+                 f'attachment; filename="market-arbitrage-{stamp}.xlsx"'},
     )
-
-
-_load_cache()
 
 
 if __name__ == "__main__":
