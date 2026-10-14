@@ -153,7 +153,7 @@ def fetch_poly_markets(cfg: ScanConfig, rep: Reporter) -> list:
 # ─────────────────────────────────── Kalshi ───────────────────────────────────
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KALSHI_PAGE = 1000
+KALSHI_EVENT_PAGE = 200          # `/events` rejects anything above 200
 KALSHI_RATE_PER_SEC = 10.0
 _session = requests.Session()
 
@@ -212,112 +212,66 @@ def _kalshi_get(url, params=None, attempts=10, timeout=20, session=None):
     raise RuntimeError(f"Kalshi request failed after {attempts} attempts: {last}")
 
 
-def _close_time_windows(start_ts: int, end_ts: int, max_windows: int) -> list:
-    """Split a close-time range into windows, denser where markets pile up.
-
-    Kalshi exposes no volume filter and ignores `order`, so the only way to find
-    the liquid markets is to walk every open one — over two million of them.
-    Slicing by close time lets those walks run in parallel. Near-dated sports
-    markets are the bulk of that count, so early slices are narrow; small,
-    numerous windows also keep every worker busy to the end of the fetch.
-    """
-    hour = 3_600
-    day = 24 * hour
-    windows, t = [], start_ts
-    while t < end_ts and len(windows) < max_windows:
-        elapsed_days = (t - start_ts) / day
-        if elapsed_days < 7:
-            step = 2 * hour
-        elif elapsed_days < 14:
-            step = 6 * hour
-        elif elapsed_days < 60:
-            step = day
-        else:
-            step = 3 * day
-        windows.append((t, min(t + step, end_ts)))
-        t += step
-    if t < end_ts:                     # everything left over in one last window
-        windows.append((t, end_ts))
-    return windows
-
-
-def _walk_kalshi_window(a: int, b: int, cfg: ScanConfig, rep: Reporter, tally: dict,
-                        lock: threading.Lock) -> list:
-    """Page through one close-time window, keeping only eligible markets."""
-    session = requests.Session()
-    kept, seen, cursor = [], 0, None
-    try:
-        while True:
-            rep.check_cancelled()
-            params = {"status": "open", "limit": KALSHI_PAGE,
-                      "min_close_ts": a, "max_close_ts": b}
-            if cursor:
-                params["cursor"] = cursor
-            data = _kalshi_get(f"{KALSHI_BASE}/markets", params=params,
-                               session=session).json()
-            batch = data.get("markets", [])
-            if not batch:
-                break
-            seen += len(batch)
-
-            for m in batch:
-                if m.get("status") not in {"open", "active"}:
-                    continue
-                if _num(m.get("volume_fp")) < cfg.min_volume:
-                    continue
-                d = _parse_iso(m.get("close_time") or m.get("expiration_time")
-                               or m.get("expected_expiration_time"))
-                if not d or d >= cfg.cutoff_date:
-                    continue
-                kept.append(m)
-
-            cursor = data.get("cursor")
-            if not cursor:
-                break
-    except Cancelled:
-        raise
-    except Exception as exc:
-        rep.log(f"  ⚠ window {datetime.fromtimestamp(a, timezone.utc):%b %d} "
-                f"stopped early: {exc}")
-    finally:
-        session.close()
-
-    with lock:
-        tally["seen"] += seen
-        tally["kept"] += len(kept)
-        tally["windows_done"] += 1
-        done, total_w = tally["windows_done"], tally["windows"]
-        rep.progress(1, f"Kalshi: {done}/{total_w} windows · "
-                        f"{tally['seen']:,} scanned · {tally['kept']} eligible",
-                     done / max(1, total_w))
-    return kept
+def _kalshi_eligible(market: dict, cfg: ScanConfig) -> bool:
+    """Volume and resolution filters Kalshi will not apply for us."""
+    if market.get("status") not in {"open", "active"}:
+        return False
+    if _num(market.get("volume_fp")) < cfg.min_volume:
+        return False
+    closes = _parse_iso(market.get("close_time") or market.get("expiration_time")
+                        or market.get("expected_expiration_time"))
+    return bool(closes and closes < cfg.cutoff_date)
 
 
 def fetch_kalshi_markets(cfg: ScanConfig, rep: Reporter) -> list:
+    """Page open events and keep the liquid markets nested inside them.
+
+    `/markets` has no volume filter, and most of its rows are combo contracts,
+    so walking it runs past a serverless time limit. `/events` leaves those
+    combos out and returns each event's markets in one page.
+    """
     rep.log("Fetching Kalshi markets…")
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    end_ts = int(cfg.cutoff_date.timestamp())
-    if end_ts <= now_ts:
+    now = datetime.now(timezone.utc)
+    if cfg.cutoff_date <= now:
         rep.log("  ⚠ Cutoff date is in the past — no Kalshi markets can qualify.")
         return []
 
-    windows = _close_time_windows(now_ts, end_ts, cfg.kalshi_max_windows)
-    tally = {"seen": 0, "kept": 0, "windows_done": 0, "windows": len(windows)}
-    lock = threading.Lock()
-    rep.log(f"  Walking every open market in {len(windows)} close-time windows "
-            f"({cfg.kalshi_workers} at a time) — Kalshi has no volume filter")
+    rep.log("  Paging open events — combo markets are left out")
+    kept, seen, cursor, page = {}, 0, None, 0
+    session = requests.Session()
+    try:
+        while True:
+            rep.check_cancelled()
+            params = {
+                "status": "open",
+                "limit": KALSHI_EVENT_PAGE,
+                "with_nested_markets": "true",
+                "min_close_ts": int(now.timestamp()),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            data = _kalshi_get(f"{KALSHI_BASE}/events", params=params,
+                               timeout=30, session=session).json()
+            events = data.get("events") or []
+            if not events:
+                break
+            page += 1
+            for event in events:
+                for market in event.get("markets") or []:
+                    seen += 1
+                    ticker = market.get("ticker")
+                    if ticker and _kalshi_eligible(market, cfg):
+                        kept[ticker] = market
+            rep.progress(1, f"Kalshi: page {page} · {seen:,} scanned · "
+                            f"{len(kept):,} eligible")
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+    finally:
+        session.close()
 
-    collected = []
-    with ThreadPoolExecutor(max_workers=cfg.kalshi_workers) as ex:
-        futures = [ex.submit(_walk_kalshi_window, a, b, cfg, rep, tally, lock)
-                   for a, b in windows]
-        for fut in as_completed(futures):
-            collected.extend(fut.result())
-
-    # Windows share their boundary second, so the same market can arrive twice.
-    unique = list({m.get("ticker"): m for m in collected}.values())
-    unique.sort(key=lambda m: _num(m.get("volume_fp")), reverse=True)
-    rep.log(f"  {tally['seen']:,} open Kalshi markets scanned")
+    unique = sorted(kept.values(), key=lambda m: _num(m.get("volume_fp")), reverse=True)
+    rep.log(f"  {seen:,} Kalshi markets scanned across {page} event pages")
     rep.log(f"  → {len(unique):,} eligible (vol ≥ ${cfg.min_volume:,.0f})")
     return unique
 

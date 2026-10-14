@@ -24,12 +24,12 @@ That opens <http://127.0.0.1:5000> in your browser. Press **Run scan**.
 Flask's development server, which is fine on your own machine. To host it, deploy
 to Vercel (below).
 
-A full scan takes roughly 4–8 minutes; almost all of it is step 1. Kalshi's API
-has no volume filter and ignores its own `order` parameter, so the only way to
-find the liquid markets is to page through every open one — about 2.1 million.
-The scan splits that walk into parallel close-time windows and streams progress
-as it goes. Keep the tab open while it runs: closing it stops the scan. Results
-stay loaded after it finishes, and your browser keeps them across page reloads.
+A full scan usually finishes in a couple of minutes. Kalshi's market list is
+mostly combo contracts and has no volume filter, so step 1 reads open events
+instead and keeps the liquid markets nested in them. Progress streams as those
+pages come in. Keep the tab open while it runs: closing it stops the scan.
+Results stay loaded after it finishes, and your browser keeps them across page
+reloads.
 
 ## Deploy to Vercel
 
@@ -45,11 +45,11 @@ Python 3.12 from `.python-version`. Files in `public/` are served from the CDN.
 Set `GROQ_API_KEY` under **Project → Settings → Environment Variables** if you
 want the server to supply the LLM key instead of each visitor.
 
-**Time limit.** A full scan with default settings takes 4–8 minutes. Vercel's
-Hobby plan stops functions after 300 seconds, so `vercel.json` sets
-`maxDuration` to 300 and the app stops scans itself at 270 seconds with a clear
-message. To stay under that, use a sooner **Resolves before** date or a higher
-**Min volume**. On a Pro plan you can raise both limits:
+**Time limit.** Vercel's Hobby plan stops functions after 300 seconds, so
+`vercel.json` sets `maxDuration` to 300 and the app stops scans itself at 270
+seconds with a clear message. Event paging normally finishes well inside that.
+If a scan still hits the limit, shorten **Resolves before** or raise the
+minimum volume. On a Pro plan you can raise both limits:
 
 1. Set `maxDuration` in `vercel.json` to up to `800`.
 2. Set the `SCAN_TIME_LIMIT` environment variable about 30 seconds lower.
@@ -127,7 +127,7 @@ python3 cli.py --no-llm --min-margin 0.02        # only edges of 2%+
 
 | Step | What happens |
 | --- | --- |
-| 1 | Fetch eligible markets from both venues, concurrently. |
+| 1 | Fetch eligible markets from both venues, concurrently. Kalshi comes from open events, which leaves combo contracts out. |
 | 2 | TF-IDF + Jaccard over the question text, with guards on numbers, months, named entities and resolution dates. |
 | 3 | An LLM confirms each surviving pair resolves on the same outcome. |
 | 4 | Pull live best asks — Polymarket CLOB books and Kalshi orderbooks — for matched markets only. |

@@ -36,8 +36,6 @@ class ScanConfig:
 
     # Fetch tuning
     orderbook_workers: int = 80
-    kalshi_workers: int = 16
-    kalshi_max_windows: int = 600
     poly_max_markets: int = 20_000
 
     def __post_init__(self):
