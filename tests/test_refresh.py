@@ -40,9 +40,12 @@ class StatelessFlowTests(unittest.TestCase):
         self.client = web.app.test_client()
         cfg = ScanConfig(use_llm=False, groq_api_key="secret-not-for-client")
         result = ScanResult(cfg)
+        # Fee-free on both venues, so these tests check the flow; test_fees checks fees.
         poly = {"question": "Will the example event happen?", "id": "p1",
-                "slug": "example", "clobTokenIds": '["yes", "no"]'}
-        kalshi = {"title": poly["question"], "ticker": "EXAMPLE-YES"}
+                "slug": "example", "clobTokenIds": '["yes", "no"]',
+                "feesEnabled": False}
+        kalshi = {"title": poly["question"], "ticker": "EXAMPLE-YES",
+                  "_fee_type": "quadratic", "_fee_multiplier": 0}
         unmatched = {"question": "Unrelated market", "id": "p2", "slug": "other"}
         result.poly = [poly, unmatched]
         result.matched_poly = [poly]

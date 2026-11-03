@@ -33,7 +33,8 @@ def cell(value, display=None, url=None, fmt=None):
 
 
 CENTS_FMT, QTY_FMT, MONEY_FMT, PCT_FMT = '0"¢"', '#,##0', '$#,##0', '0.00"%"'
-DAYS_FMT = '0"d"' 
+DAYS_FMT = '0"d"'
+CENTS2_FMT = '0.00"¢"' 
 
 
 def cents(v):
@@ -45,6 +46,14 @@ def cents(v):
     except (TypeError, ValueError):
         return cell(None, DASH)
     return cell(c, f"{c}¢", fmt=CENTS_FMT)
+
+
+def cents_fine(v, suffix=""):
+    """Sub-cent precision for fees: 0.0175 → '1.75¢'."""
+    if v is None:
+        return cell(None, DASH)
+    c = round(float(v) * 100, 2)
+    return cell(c, f"{c:.2f}¢{suffix}", fmt=CENTS2_FMT)
 
 
 def qty(v):
@@ -165,7 +174,7 @@ def _col(key, label, align="left", width=110, kind="text"):
 ARB_COLUMNS = [
     _col("num", "#", "center", 44, "num"),
     _col("apr", "Annualized", "center", 96, "num"),
-    _col("margin", "Edge", "center", 76, "num"),
+    _col("margin", "Net edge", "center", 84, "num"),
     _col("roi", "ROI", "center", 72, "num"),
     _col("days", "Days", "center", 64, "num"),
     _col("p_title", "Polymarket market", "left", 300, "text"),
@@ -176,6 +185,8 @@ ARB_COLUMNS = [
     _col("buy_kalshi", "Buy", "center", 62, "side"),
     _col("kalshi_price", "Price", "center", 66, "num"),
     _col("kalshi_qty", "Ask qty", "right", 78, "num"),
+    _col("gross", "Gross edge", "center", 88, "num"),
+    _col("fees", "Fees / pair", "center", 96, "num"),
     _col("cost", "Cost / pair", "center", 88, "num"),
     _col("size", "Max pairs", "right", 86, "num"),
     _col("profit", "Max profit", "right", 92, "num"),
@@ -270,7 +281,10 @@ def _arb_rows(arbs):
             k_side,
             cents(k_price),
             qty(k_qty),
-            cents(arb["prob_sum"]),
+            pct(arb.get("gross_margin", arb["margin"]), 2),
+            cents_fine(arb.get("fees_per_pair"),
+                       " est." if arb.get("fees_estimated") else ""),
+            cents_fine(arb.get("cost", arb["prob_sum"])),
             qty(arb.get("max_contracts")),
             money(arb["max_profit"]) if arb.get("max_profit") else cell(None, DASH),
             pct(arb.get("match_score"), 0),
@@ -355,10 +369,11 @@ def build_sheets(result) -> list:
 
     return [
         {"key": "arbitrage", "name": "Arbitrage",
-         "hint": ("Ranked by annualized return: ROI (edge ÷ cost) scaled by days until the "
-                  "later leg settles. Confirm both questions resolve alike before trading."),
+         "hint": ("Net of both venues' taker fees, ranked by annualized return (net ROI "
+                  "scaled by days until the later leg settles). \"est.\" = fee data "
+                  "missing, highest standard rate assumed. Confirm both questions resolve alike."),
          "columns": ARB_COLUMNS, "rows": _arb_rows(result.arbs),
-         "empty": "No arbitrage on current best asks — the matched books all price above $1.00 combined."},
+         "empty": "No arbitrage on current best asks after fees — the matched books all cost $1.00 or more per pair."},
 
         {"key": "verified", "name": "LLM Verified",
          "hint": f"Pairs an LLM confirmed resolve on the same outcome (≥{result.config.groq_confidence_cutoff:.0%} confidence).",

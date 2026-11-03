@@ -25,6 +25,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity as sk_cosine_sim
 
 from .config import ScanConfig
+from .fees import fee_known, leg_fee
 
 TOTAL_STEPS = 5
 
@@ -297,6 +298,8 @@ def fetch_kalshi_markets(cfg: ScanConfig, rep: Reporter) -> list:
             for event in events:
                 for market in event.get("markets") or []:
                     seen += 1
+                    # Fees are set per series; nested markets don't carry it.
+                    market.setdefault("series_ticker", event.get("series_ticker"))
                     ticker = market.get("ticker")
                     if ticker and _kalshi_eligible(market, cfg):
                         kept[ticker] = market
@@ -312,6 +315,37 @@ def fetch_kalshi_markets(cfg: ScanConfig, rep: Reporter) -> list:
     rep.log(f"  {seen:,} Kalshi markets scanned across {page} event pages")
     rep.log(f"  → {len(unique):,} eligible (vol ≥ ${cfg.min_volume:,.0f})")
     return unique
+
+
+def fetch_kalshi_series_fees(markets, cfg: ScanConfig, rep: Reporter):
+    """Attach each market's series fee_type / fee_multiplier (one call per series).
+
+    Only matched markets need this, so it runs alongside the orderbook fetch.
+    A failed lookup leaves the fields unset, and fees.py then assumes the
+    standard fee.
+    """
+    series = {m.get("series_ticker") for m in markets if m.get("series_ticker")}
+    if not series:
+        return
+    found = {}
+
+    def one(ticker):
+        try:
+            data = _kalshi_get(f"{KALSHI_BASE}/series/{ticker}", attempts=3).json()
+            return ticker, data.get("series") or {}
+        except Exception:
+            return ticker, None
+
+    with ThreadPoolExecutor(max_workers=min(16, len(series))) as ex:
+        for ticker, info in ex.map(one, series):
+            if info:
+                found[ticker] = info
+    for m in markets:
+        info = found.get(m.get("series_ticker"))
+        if info:
+            m["_fee_type"] = info.get("fee_type")
+            m["_fee_multiplier"] = info.get("fee_multiplier")
+    rep.log(f"  Kalshi fee schedule loaded for {len(found)}/{len(series)} series")
 
 
 # ───────────────────────────────── Orderbooks ─────────────────────────────────
@@ -828,17 +862,23 @@ def _kalshi_best_asks_from_ob(kob):
     return (*_executable_ask(ya, yq), *_executable_ask(na, nq))
 
 
+# Size used to quote fees when a book shows no resting quantity.
+FEE_QUOTE_SIZE = 100
+
+
 def find_arbitrage(matches, poly_markets, kalshi_markets,
                    poly_ob, kalshi_ob, cfg: ScanConfig, rep: Reporter) -> list:
     """Cross-platform arb from CLOB / Kalshi best asks only (never listed prices).
 
-    A pair is an arb when YES on one venue plus NO on the other costs < $1.00,
-    since exactly one of the two legs pays out $1.00 at resolution.
+    A pair is an arb when YES on one venue plus NO on the other, plus both
+    venues' taker fees, costs < $1.00, since exactly one of the two legs pays
+    out $1.00 at resolution. Fees are priced at the largest size both books can
+    fill (Kalshi rounds its fee up to the cent per order, so size matters).
     """
     p_ix = {id(m): i for i, m in enumerate(poly_markets)}
     k_ix = {id(m): i for i, m in enumerate(kalshi_markets)}
     now = datetime.now(timezone.utc)
-    arbs = []
+    arbs, fee_killed = [], 0
 
     for poly, kalshi, shared, score in matches:
         pi, ki = p_ix.get(id(poly)), k_ix.get(id(kalshi))
@@ -864,14 +904,34 @@ def find_arbitrage(matches, poly_markets, kalshi_markets,
                 continue
 
             ask_sum = a_price + b_price
-            margin = 1.0 - ask_sum
-            if margin <= 0 or margin < cfg.min_margin:
+            gross = 1.0 - ask_sum
+            if gross <= 0:
                 continue
 
             max_contracts = min(a_sz, b_sz) if (a_sz and b_sz) else None
+            n = max_contracts or FEE_QUOTE_SIZE
+            a_mkt = poly if a_plat == "Polymarket" else kalshi
+            b_mkt = kalshi if b_plat == "Kalshi" else poly
+            a_fee = leg_fee(a_plat, a_mkt, n, a_price)
+            b_fee = leg_fee(b_plat, b_mkt, n, b_price)
+            fees_per_pair = (a_fee + b_fee) / n
+            margin = gross - fees_per_pair
+            if margin <= 0:
+                fee_killed += 1
+                continue
+            if margin < cfg.min_margin:
+                continue
+
+            cost = ask_sum + fees_per_pair
             days = pair_days(poly, kalshi, now)
-            roi = margin / ask_sum            # profit per dollar actually deployed
+            roi = margin / cost               # profit per dollar actually deployed
             arbs.append({
+                "gross_margin": gross,
+                "fees_per_pair": fees_per_pair,
+                "a_fee": a_fee, "b_fee": b_fee, "fee_size": n,
+                "fees_estimated": not (fee_known(a_plat, a_mkt)
+                                       and fee_known(b_plat, b_mkt)),
+                "cost": cost,
                 "days": days,
                 "roi": roi,
                 "apr": annualized_return(roi, days),
@@ -894,7 +954,9 @@ def find_arbitrage(matches, poly_markets, kalshi_markets,
     arbs.sort(key=lambda x: (x["apr"] is not None, x["apr"] or 0, x["margin"]),
               reverse=True)
     rep.log(f"  {len(arbs)} arbitrage opportunit{'y' if len(arbs) == 1 else 'ies'} "
-            f"found on executable best asks")
+            f"found on executable best asks, net of taker fees")
+    if fee_killed:
+        rep.log(f"  {fee_killed} more had a gross edge that fees wiped out")
     return arbs
 
 
@@ -961,6 +1023,7 @@ def run_scan(cfg: ScanConfig, rep: Reporter = None) -> ScanResult:
             f"Kalshi markets need books")
     res.poly_ob, res.kalshi_ob = fetch_all_orderbooks(
         res.matched_poly, res.matched_kalshi, cfg, rep)
+    fetch_kalshi_series_fees(res.matched_kalshi, cfg, rep)
     if res.poly_ob or res.kalshi_ob:
         res.prices_updated_at = datetime.now(timezone.utc)
     rep.check_cancelled()

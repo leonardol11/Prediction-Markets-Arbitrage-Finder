@@ -151,6 +151,7 @@ vercel.json         Function duration and bundle exclusions for Vercel
 matcher/
   config.py         ScanConfig — every knob the UI exposes
   core.py           Fetching, matching, LLM verification, arbitrage scan
+  fees.py           Taker fee formulas for both venues
   sheets.py         One sheet model feeding both the web grid and Excel
   excel.py          Styled workbook writer
 templates/, public/ The website (public/ is served by Vercel's CDN)
@@ -158,9 +159,19 @@ templates/, public/ The website (public/ is served by Vercel's CDN)
 
 ## Caveats
 
-Edges are **gross**. Before trusting one, account for:
+Edges are **net of taker fees** (every leg buys at the ask, so it is a taker):
 
-- **Fees** — Kalshi charges on trades and settlement; Polymarket has gas.
+- **Polymarket**: `shares × rate × p × (1 − p)`, where `rate` comes from each
+  market's `feeSchedule` (e.g. 0.04 politics, 0.07 crypto, 0 geopolitics).
+  [Docs](https://docs.polymarket.com/trading/fees).
+- **Kalshi**: `0.07 × contracts × P × (1 − P) × fee_multiplier`, rounded up to
+  the cent per order. The multiplier comes from the market's series (1, 0.5, or
+  0). [Fee rounding](https://docs.kalshi.com/getting_started/fee_rounding).
+- Missing fee data is priced at the highest standard rate and marked `est.`.
+
+Ranking is by annualized net return. Before trusting an edge, still account for:
+
+- **Withdrawal / on-ramp costs**: bank, card or bridge fees outside either venue.
 - **Depth** — `Ask qty` is the size resting at that price. `Max pairs` is the
   smaller of the two legs; past that the price moves.
 - **Staleness** — books move in seconds. Re-check before sending an order.
