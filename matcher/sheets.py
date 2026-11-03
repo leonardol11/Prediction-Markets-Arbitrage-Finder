@@ -10,8 +10,10 @@ can never drift apart.
 """
 
 import json
+from datetime import datetime, timezone
 
-from .core import _num, kalshi_title, poly_title
+from .core import (_num, days_until, kalshi_end, kalshi_title, pair_days,
+                   poly_end, poly_title)
 
 
 # ─────────────────────────────── cell helpers ─────────────────────────────────
@@ -30,7 +32,8 @@ def cell(value, display=None, url=None, fmt=None):
     return out
 
 
-CENTS_FMT, QTY_FMT, MONEY_FMT, PCT_FMT = '0"¢"', '#,##0', '$#,##0', '0.00"%"' 
+CENTS_FMT, QTY_FMT, MONEY_FMT, PCT_FMT = '0"¢"', '#,##0', '$#,##0', '0.00"%"'
+DAYS_FMT = '0"d"' 
 
 
 def cents(v):
@@ -66,6 +69,13 @@ def pct(v, places=1):
     except (TypeError, ValueError):
         return cell(None, DASH)
     return cell(round(x * 100, 4), f"{x * 100:.{places}f}%", fmt=PCT_FMT)
+
+
+def days_cell(d):
+    """Fractional days → whole-day display; '<1d' for same-day settlement."""
+    if d is None:
+        return cell(None, DASH)
+    return cell(round(d, 2), "<1d" if d < 1 else f"{d:.0f}d", fmt=DAYS_FMT)
 
 
 def day(s):
@@ -154,7 +164,10 @@ def _col(key, label, align="left", width=110, kind="text"):
 
 ARB_COLUMNS = [
     _col("num", "#", "center", 44, "num"),
+    _col("apr", "Annualized", "center", 96, "num"),
     _col("margin", "Edge", "center", 76, "num"),
+    _col("roi", "ROI", "center", 72, "num"),
+    _col("days", "Days", "center", 64, "num"),
     _col("p_title", "Polymarket market", "left", 300, "text"),
     _col("buy_poly", "Buy", "center", 62, "side"),
     _col("poly_price", "Price", "center", 66, "num"),
@@ -177,6 +190,7 @@ def _match_columns(score_label):
     return [
         _col("num", "#", "center", 48, "num"),
         _col("score", score_label, "center", 92, "num"),
+        _col("days", "Days", "center", 64, "num"),
         _col("p_title", "Polymarket market", "left", 330, "text"),
         _col("p_date", "Resolves", "center", 100, "text"),
         _col("p_yes", "Yes", "center", 68, "num"),
@@ -205,6 +219,7 @@ POLY_COLUMNS = [
     _col("num", "#", "center", 48, "num"),
     _col("title", "Market", "left", 460, "text"),
     _col("date", "Resolves", "center", 100, "text"),
+    _col("days", "Days", "center", 64, "num"),
     _col("yes", "Yes", "center", 68, "num"),
     _col("no", "No", "center", 68, "num"),
     _col("spread", "Spread", "center", 78, "num"),
@@ -217,6 +232,7 @@ KALSHI_COLUMNS = [
     _col("num", "#", "center", 48, "num"),
     _col("title", "Market", "left", 460, "text"),
     _col("date", "Resolves", "center", 100, "text"),
+    _col("days", "Days", "center", 64, "num"),
     _col("yes", "Yes", "center", 68, "num"),
     _col("no", "No", "center", 68, "num"),
     _col("spread", "Spread", "center", 78, "num"),
@@ -242,7 +258,10 @@ def _arb_rows(arbs):
 
         rows.append([
             i + 1,
+            pct(arb["apr"], 1) if arb.get("apr") is not None else cell(None, DASH),
             pct(arb["margin"], 2),
+            pct(arb.get("roi"), 2),
+            days_cell(arb.get("days")),
             cell(poly_title(p), poly_title(p), poly_url(p)),
             p_side,
             cents(p_price),
@@ -263,6 +282,7 @@ def _arb_rows(arbs):
 
 
 def _match_rows(pairs, poly_ob, kalshi_ob, poly_idx, kalshi_idx):
+    now = datetime.now(timezone.utc)
     rows = []
     for i, (p, k, shared, score) in enumerate(pairs):
         pi = poly_idx.get(id(p), -1)
@@ -276,6 +296,7 @@ def _match_rows(pairs, poly_ob, kalshi_ob, poly_idx, kalshi_idx):
         rows.append([
             i + 1,
             pct(score, 0),
+            days_cell(pair_days(p, k, now)),
             cell(poly_title(p), poly_title(p), poly_url(p)),
             day(poly_day(p)),
             cents(poly_price(p, "Yes", 0)),
@@ -296,10 +317,12 @@ def _match_rows(pairs, poly_ob, kalshi_ob, poly_idx, kalshi_idx):
 
 
 def _poly_rows(markets):
+    now = datetime.now(timezone.utc)
     return [[
         i + 1,
         cell(poly_title(m), poly_title(m), poly_url(m)),
         day(poly_day(m)),
+        days_cell(days_until(poly_end(m), now)),
         cents(poly_price(m, "Yes", 0)),
         cents(poly_price(m, "No", 1)),
         cents(poly_spread(m)),
@@ -310,10 +333,12 @@ def _poly_rows(markets):
 
 
 def _kalshi_rows(markets):
+    now = datetime.now(timezone.utc)
     return [[
         i + 1,
         cell(kalshi_title(m), kalshi_title(m), kalshi_url(m)),
         day(kalshi_day(m)),
+        days_cell(days_until(kalshi_end(m), now)),
         cents(_num(m.get("yes_ask_dollars"), None)),
         cents(_num(m.get("no_ask_dollars"), None)),
         cents(kalshi_spread(m)),
@@ -330,8 +355,8 @@ def build_sheets(result) -> list:
 
     return [
         {"key": "arbitrage", "name": "Arbitrage",
-         "hint": ("Buy both legs at these asks; one leg always pays $1.00. "
-                  "Confirm the two questions really resolve alike before trading."),
+         "hint": ("Ranked by annualized return: ROI (edge ÷ cost) scaled by days until the "
+                  "later leg settles. Confirm both questions resolve alike before trading."),
          "columns": ARB_COLUMNS, "rows": _arb_rows(result.arbs),
          "empty": "No arbitrage on current best asks — the matched books all price above $1.00 combined."},
 
@@ -364,7 +389,8 @@ def build_sheets(result) -> list:
 
 
 def build_summary(result) -> dict:
-    best = result.arbs[0]["margin"] if result.arbs else None
+    # Arbs are ranked by annualized return, so the biggest raw edge may not be first.
+    best = max((a["margin"] for a in result.arbs), default=None)
     return {
         "poly_count": len(result.poly),
         "kalshi_count": len(result.kalshi),

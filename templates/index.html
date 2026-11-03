@@ -109,6 +109,14 @@
     <div class="sheet-hint" id="sheet-hint"></div>
     <div class="toolbar-right">
       <input id="filter" type="search" placeholder="Filter rows…" aria-label="Filter active sheet rows" autocomplete="off">
+      <select id="horizon" aria-label="Only show markets resolving within">
+        <option value="">Any expiry</option>
+        <option value="1">Within 1 day</option>
+        <option value="7">Within 7 days</option>
+        <option value="30">Within 30 days</option>
+        <option value="90">Within 90 days</option>
+        <option value="180">Within 180 days</option>
+      </select>
       <span id="row-count" class="row-count"></span>
       <button id="copy-btn" class="btn btn-ghost btn-sm">Copy CSV</button>
     </div>

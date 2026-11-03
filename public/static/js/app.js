@@ -21,6 +21,7 @@ const state = {
   active: 0,
   sort: {},                              // sheetKey -> {col, dir}
   filter: "",
+  horizon: Number(stored("pmaf-horizon", "")) || null,  // max days to resolution; persists across tabs
   rendered: 0,
   view: [],                              // filtered+sorted rows for active sheet
   abort: null,                           // AbortController of the running scan
@@ -607,6 +608,16 @@ function renderSheet(minRows = CHUNK) {
     const q = state.filter.toLowerCase();
     rows = rows.filter((r) => r.some((c) => disp(c).toLowerCase().includes(q)));
   }
+  const daysCol = sheet.columns.findIndex((c) => c.key === "days");
+  const horizonOn = state.horizon && daysCol >= 0;
+  $("horizon").disabled = daysCol < 0;
+  if (horizonOn) {
+    // Markets with no known resolution date are hidden while a horizon is set.
+    rows = rows.filter((r) => {
+      const d = raw(r[daysCol]);
+      return typeof d === "number" && d <= state.horizon;
+    });
+  }
   if (sort) {
     const { col, dir } = sort;
     rows = rows.slice().sort((a, b) => {
@@ -630,8 +641,8 @@ function renderSheet(minRows = CHUNK) {
     $("grid").hidden = true;
     $("empty-state").hidden = false;
     $("empty-state").innerHTML =
-      `<h2>${state.filter ? "No matching rows" : "Nothing here"}</h2><p>${
-        state.filter ? "Try a different filter." : (sheet.empty || "")}</p>`;
+      `<h2>${state.filter || horizonOn ? "No matching rows" : "Nothing here"}</h2><p>${
+        state.filter || horizonOn ? "Try a different filter or a longer expiry window." : (sheet.empty || "")}</p>`;
     return;
   }
   do { appendRows(); } while (state.rendered < Math.min(minRows, state.view.length));
@@ -688,6 +699,14 @@ let filterTimer;
 $("filter").oninput = (e) => {
   clearTimeout(filterTimer);
   filterTimer = setTimeout(() => { state.filter = e.target.value.trim(); renderSheet(); }, 140);
+};
+
+$("horizon").value = state.horizon ? String(state.horizon) : "";
+$("horizon").onchange = (e) => {
+  state.horizon = Number(e.target.value) || null;
+  persist("pmaf-horizon", e.target.value);
+  renderSheet();
+  $("grid-wrap").scrollTop = 0;
 };
 
 $("copy-btn").onclick = async () => {

@@ -30,6 +30,11 @@ def parse_sse(text):
     return events
 
 
+
+def _cell(sheet, row, key):
+    col = next(i for i, c in enumerate(sheet["columns"]) if c["key"] == key)
+    return sheet["rows"][row][col]
+
 class StatelessFlowTests(unittest.TestCase):
     def setUp(self):
         self.client = web.app.test_client()
@@ -117,7 +122,7 @@ class StatelessFlowTests(unittest.TestCase):
         data = response.get_json()
         self.assertEqual(data["summary"]["arb_count"], 1)
         self.assertAlmostEqual(data["summary"]["best_margin"], 0.2)
-        self.assertEqual(data["sheets"][2]["rows"][0][7]["v"], 30)
+        self.assertEqual(_cell(data["sheets"][2], 0, "p_yes_ask")["v"], 30)
 
     def test_unavailable_books_report_failure(self):
         self.assertEqual(self.refresh(({}, {})).status_code, 502)
@@ -127,7 +132,7 @@ class StatelessFlowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertEqual(data["summary"]["arb_count"], 0)
-        self.assertIsNone(data["sheets"][2]["rows"][0][7]["v"])
+        self.assertIsNone(_cell(data["sheets"][2], 0, "p_yes_ask")["v"])
 
     def test_invalid_context_is_rejected(self):
         bad = dict(self.snapshot["context"], matched_poly=[99])

@@ -222,12 +222,13 @@ html[data-theme="dark"] .btn-primary { color: #0b0d12; }
 }
 .sheet-hint { font-size: 12.5px; color: var(--muted); }
 .toolbar-right { display: flex; align-items: center; gap: 10px; }
-#filter {
+#filter, #horizon {
   font: 400 13px/1 Inter, sans-serif; color: var(--text);
   background: var(--panel-2); border: 1px solid var(--line);
   border-radius: 7px; padding: 7px 10px; width: 220px;
 }
-#filter:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent); }
+#horizon { width: auto; cursor: pointer; }
+#filter:focus-visible, #horizon:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent); }
 .row-count { font: 500 12px/1 var(--mono); color: var(--faint); white-space: nowrap; }
 
 /* ── grid ────────────────────────────────────────────────────────────────── */

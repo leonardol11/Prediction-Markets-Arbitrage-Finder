@@ -71,6 +71,44 @@ def _parse_iso(s: str):
         return None
 
 
+def poly_end(market):
+    return _parse_iso(market.get("endDate") or market.get("end_date_iso"))
+
+
+def kalshi_end(market):
+    # Expected expiration is when Kalshi actually settles; close_time is when trading stops.
+    return _parse_iso(market.get("expected_expiration_time")
+                      or market.get("expiration_time") or market.get("close_time"))
+
+
+def days_until(dt, now=None):
+    """Fractional days from now until dt (never negative), or None if unknown."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return max(0.0, (dt - now).total_seconds() / 86400)
+
+
+def pair_days(poly, kalshi, now=None):
+    """Capital is locked until both legs settle, so use the later date."""
+    days = [d for d in (days_until(poly_end(poly), now), days_until(kalshi_end(kalshi), now))
+            if d is not None]
+    return max(days) if days else None
+
+
+# Floor for annualizing: a market closing in an hour would otherwise show a
+# meaningless five-digit APR, and settlement/withdrawal rarely beats a day.
+MIN_ANNUALIZE_DAYS = 1.0
+
+
+def annualized_return(roi, days):
+    if roi is None or days is None:
+        return None
+    return roi * 365.0 / max(days, MIN_ANNUALIZE_DAYS)
+
+
 def _num(v, default=0.0) -> float:
     try:
         return float(v)
@@ -799,6 +837,7 @@ def find_arbitrage(matches, poly_markets, kalshi_markets,
     """
     p_ix = {id(m): i for i, m in enumerate(poly_markets)}
     k_ix = {id(m): i for i, m in enumerate(kalshi_markets)}
+    now = datetime.now(timezone.utc)
     arbs = []
 
     for poly, kalshi, shared, score in matches:
@@ -830,7 +869,12 @@ def find_arbitrage(matches, poly_markets, kalshi_markets,
                 continue
 
             max_contracts = min(a_sz, b_sz) if (a_sz and b_sz) else None
+            days = pair_days(poly, kalshi, now)
+            roi = margin / ask_sum            # profit per dollar actually deployed
             arbs.append({
+                "days": days,
+                "roi": roi,
+                "apr": annualized_return(roi, days),
                 "poly": poly, "kalshi": kalshi,
                 "shared": shared, "match_score": score,
                 "a_plat": a_plat, "a_side": a_side,
@@ -845,7 +889,10 @@ def find_arbitrage(matches, poly_markets, kalshi_markets,
                 "kalshi_ob": kalshi_ob.get(ki),
             })
 
-    arbs.sort(key=lambda x: x["margin"], reverse=True)
+    # Rank by annualized return so a quick 2% beats a 3% locked up for months.
+    # Arbs with no known resolution date fall to the bottom, ordered by edge.
+    arbs.sort(key=lambda x: (x["apr"] is not None, x["apr"] or 0, x["margin"]),
+              reverse=True)
     rep.log(f"  {len(arbs)} arbitrage opportunit{'y' if len(arbs) == 1 else 'ies'} "
             f"found on executable best asks")
     return arbs
