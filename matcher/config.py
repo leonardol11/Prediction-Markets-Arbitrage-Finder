@@ -7,6 +7,29 @@ from datetime import datetime, timedelta, timezone
 DEFAULT_HORIZON_DAYS = 180
 
 
+def _load_local_env() -> None:
+    """Read a gitignored .env so a local GROQ_API_KEY is used without exporting it."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key.startswith("export "):
+                    key = key[len("export "):].strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        return
+
+
+_load_local_env()
+
+
 def _default_cutoff() -> datetime:
     """A rolling horizon — a hard-coded date silently empties the scan once passed."""
     return datetime.now(timezone.utc) + timedelta(days=DEFAULT_HORIZON_DAYS)
@@ -27,7 +50,7 @@ class ScanConfig:
     # LLM verification (Groq)
     use_llm: bool = True
     groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
     groq_batch_size: int = 50
     groq_confidence_cutoff: float = 0.65
 

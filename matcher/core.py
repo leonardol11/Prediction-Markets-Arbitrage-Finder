@@ -751,6 +751,7 @@ def _call_groq_verify(pairs_text: str, cfg: ScanConfig, rep: Reporter,
                 headers={"Authorization": f"Bearer {cfg.groq_api_key}",
                          "Content-Type": "application/json"},
                 json={"model": cfg.groq_model, "temperature": 0,
+                      "reasoning_effort": "low", "include_reasoning": False,
                       "messages": [{"role": "user", "content": prompt}]},
                 timeout=120,
             )
