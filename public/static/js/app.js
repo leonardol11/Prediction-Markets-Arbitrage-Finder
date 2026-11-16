@@ -85,7 +85,7 @@ $("theme-toggle").onclick = () => {
 
 /* ── settings persistence ──────────────────────────────────────────────── */
 const SETTING_IDS = ["min_volume", "cutoff", "similarity", "min_margin",
-                     "confidence", "groq_api_key"];
+                     "near_margin", "llm_budget", "confidence", "groq_api_key"];
 
 (function restoreSettings() {
   let saved = {};
@@ -272,7 +272,9 @@ async function refreshPrices() {
     if (state.snapshot !== base) return;   // A new scan replaced this snapshot.
     // Refresh returns only repriced sheets; raw market tabs stay as discovered.
     const repriced = new Map(data.sheets.map((sheet) => [sheet.key, sheet]));
-    const snapshot = { ...data, sheets: base.sheets.map((sheet) => repriced.get(sheet.key) || sheet) };
+    // A refresh never calls the LLM, so the scan's cached verdicts carry over.
+    const snapshot = { ...data, verify_cache: base.verify_cache,
+                       sheets: base.sheets.map((sheet) => repriced.get(sheet.key) || sheet) };
     applyResults(snapshot, true);
     saveSnapshot(snapshot);
   } catch (error) {
@@ -324,25 +326,30 @@ async function startScan() {
   markRunningCopy(true);
   $("console").hidden = false;
   $("console-body").textContent = "";
-  setStatus("running", "Starting", "Discovering new markets may take a few minutes.");
+  setStatus("running", "Starting", "Discovering new markets takes about a minute.");
   setProgress(1, 5, "Discovering markets");
   syncControls();
 
   let outcome = { status: "error", error: "The scan connection closed before the scan finished." };
   try {
+    const nearMargin = parseFloat($("near_margin").value);
     const res = await fetch("/api/scan", {
       method: "POST",
       signal: state.abort.signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      ...(await jsonBody({
         min_volume: $("min_volume").value,
         cutoff: $("cutoff").value,
         similarity: $("similarity").value,
         min_margin: (parseFloat($("min_margin").value) || 0) / 100,
+        near_margin: Number.isFinite(nearMargin) ? nearMargin / 100 : "",
         confidence: $("confidence").value,
+        llm_budget: $("llm_budget").value,
         use_llm: $("use_llm").checked,
         groq_api_key: $("groq_api_key").value,
-      }),
+        // Verdicts from the last scan: the server reuses the ones whose
+        // market rules are unchanged instead of asking the LLM again.
+        verify_cache: state.snapshot?.verify_cache || null,
+      })),
     });
     if (!res.ok || !res.body) {
       let message = `The server refused the scan (${res.status}).`;
@@ -505,10 +512,11 @@ function renderSummary(s) {
     stat("Best edge", s.arb_count ? s.best_margin_display : "—",
          s.arb_count ? "per $1.00 pair" : "no qualifying edge",
          s.arb_count ? "stat-hero" : "stat-zero"),
-    stat("Arbitrage", s.arb_count.toLocaleString(), `from ${s.arb_source}`,
+    stat("Live arbitrage", s.arb_count.toLocaleString(), "verified and executable",
          s.arb_count ? "" : "stat-zero"),
     stat("LLM verified", s.verified_count.toLocaleString(),
-         s.llm_used ? "same-outcome pairs" : "LLM off"),
+         s.pending_count ? `${s.pending_count.toLocaleString()} not yet checked`
+                         : (s.llm_used ? "same-outcome pairs" : "LLM off")),
     stat("Matches", s.match_count.toLocaleString(), "title pairs"),
     stat("Polymarket", s.poly_count.toLocaleString(), "eligible markets"),
     stat("Kalshi", s.kalshi_count.toLocaleString(), "eligible markets"),

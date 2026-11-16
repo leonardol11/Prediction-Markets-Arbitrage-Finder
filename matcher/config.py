@@ -51,11 +51,25 @@ class ScanConfig:
     use_llm: bool = True
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"
-    groq_batch_size: int = 50
+    groq_batch_size: int = 8             # most pairs sent in one request
+    groq_batch_tokens: int = 2600        # rough token ceiling for one request
+    groq_concurrency: int = 2            # requests in flight at once
     groq_confidence_cutoff: float = 0.65
+    # Seconds one scan may spend on new LLM verdicts (0 = no limit). The most
+    # plausible pairs go first; whatever is left is picked up by the next scan,
+    # which reuses every verdict already made.
+    llm_budget_seconds: float = 45.0
+
+    # Verified-pair cache ("" = default location, see verify_cache.py)
+    use_verify_cache: bool = True
+    verify_cache_path: str = ""
+    verify_cache_ttl_days: float = 30.0
+    verify_cache_seed: dict = field(default_factory=dict, repr=False)
 
     # Arbitrage
     min_margin: float = 0.0          # e.g. 0.01 => only show >= 1% edge
+    near_margin: float = 0.02        # watch pairs within this much of break-even
+    stale_quote_seconds: float = 30.0    # older quotes never count as live
 
     # Fetch tuning
     orderbook_workers: int = 80

@@ -13,7 +13,7 @@ from openpyxl import load_workbook
 
 import app as web
 from matcher.config import ScanConfig
-from matcher.core import Reporter, ScanResult, find_arbitrage
+from matcher.core import Reporter, ScanResult, find_arbitrage, make_book, pair_id
 
 
 def parse_sse(text):
@@ -51,9 +51,13 @@ class StatelessFlowTests(unittest.TestCase):
         result.matched_poly = [poly]
         result.kalshi = result.matched_kalshi = [kalshi]
         result.matches = [(poly, kalshi, {"example", "event"}, 0.9)]
+        # Only an LLM-verified pair can be arbitrage.
+        result.verified = [(poly, kalshi, {"example", "event"}, 0.95)]
+        result.pair_status = {pair_id(poly, kalshi): "verified"}
+        result.llm_used = True
         result.poly_ob, result.kalshi_ob = self.books(0.4)
         result.prices_updated_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        result.arbs = find_arbitrage(result.matches, result.matched_poly,
+        result.arbs = find_arbitrage(result.verified, result.matched_poly,
                                     result.matched_kalshi, result.poly_ob,
                                     result.kalshi_ob, cfg, Reporter())
         result.finished_at = datetime.now(timezone.utc)
@@ -66,8 +70,8 @@ class StatelessFlowTests(unittest.TestCase):
 
     @staticmethod
     def books(yes_price):
-        return ({0: {"yes": (yes_price, 20), "no": (0.8, 10)}},
-                {0: ((0.7, 15), (0.5, 12))})
+        return ({0: make_book(yes=[(yes_price, 20)], no=[(0.8, 10)])},
+                {0: make_book(yes=[(0.7, 15)], no=[(0.5, 12)])})
 
     def refresh(self, books, context=None, gzip_body=False):
         body = json.dumps({"context": context or self.snapshot["context"]}).encode()
@@ -85,7 +89,7 @@ class StatelessFlowTests(unittest.TestCase):
         book = load_workbook(io.BytesIO(response.data), read_only=True)
         try:
             return any("Will the example event happen?" in row
-                       for row in book["Arbitrage"].iter_rows(values_only=True))
+                       for row in book["Live Arbitrage"].iter_rows(values_only=True))
         finally:
             book.close()
 
@@ -127,11 +131,20 @@ class StatelessFlowTests(unittest.TestCase):
         self.assertAlmostEqual(data["summary"]["best_margin"], 0.2)
         self.assertEqual(_cell(data["sheets"][2], 0, "p_yes_ask")["v"], 30)
 
+    def test_refresh_keeps_verdicts_and_never_calls_the_llm(self):
+        with patch("matcher.core.requests.post") as post:
+            data = self.refresh(self.books(0.3)).get_json()
+        post.assert_not_called()
+        self.assertEqual(data["summary"]["verified_count"], 1)
+        self.assertEqual(_cell(data["sheets"][1], 0, "status"), "Live arb")
+        self.assertEqual(_cell(data["sheets"][2], 0, "status"), "Verified · live arb")
+        self.assertNotIn("verify_cache", data)
+
     def test_unavailable_books_report_failure(self):
         self.assertEqual(self.refresh(({}, {})).status_code, 502)
 
     def test_partial_books_do_not_reuse_old_asks(self):
-        response = self.refresh(({0: {"no": (0.8, 10)}}, self.books(0.4)[1]))
+        response = self.refresh(({0: make_book(no=[(0.8, 10)])}, self.books(0.4)[1]))
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertEqual(data["summary"]["arb_count"], 0)
@@ -140,7 +153,7 @@ class StatelessFlowTests(unittest.TestCase):
     def test_invalid_context_is_rejected(self):
         bad = dict(self.snapshot["context"], matched_poly=[99])
         self.assertEqual(self.refresh(self.books(0.4), context=bad).status_code, 400)
-        old = dict(self.snapshot["context"], version=1)
+        old = dict(self.snapshot["context"], version=2)
         self.assertEqual(self.refresh(self.books(0.4), context=old).status_code, 400)
         response = self.client.post("/api/refresh", data=b"not gzip",
                                     headers={"X-Content-Encoding": "gzip"})

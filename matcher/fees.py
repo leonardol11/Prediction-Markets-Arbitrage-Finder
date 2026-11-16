@@ -80,6 +80,30 @@ def leg_fee(platform: str, market: dict, contracts: float, price: float) -> floa
     return kalshi_taker_fee(market, contracts, price)
 
 
+def order_fee(platform: str, market: dict, fills) -> float:
+    """Fee for one order that fills at several price levels: [(contracts, price), ...].
+
+    Polymarket charges each fill separately. Kalshi sums the fills' trade fees
+    and rounds the order's total up to the next cent once.
+    """
+    if platform == "Polymarket":
+        return sum(poly_taker_fee(market, c, p) for c, p in fills)
+    mult, _ = kalshi_fee_multiplier(market)
+    raw = sum(KALSHI_TAKER_COEF * mult * c * p * (1 - p) for c, p in fills)
+    return math.ceil(round(raw * 100, 9)) / 100
+
+
+def marginal_fee(platform: str, market: dict, price: float) -> float:
+    """Unrounded fee for one more contract at `price` — used to decide whether
+    the next book level is still worth taking."""
+    if platform == "Polymarket":
+        rate, _ = poly_fee_rate(market)
+    else:
+        mult, _ = kalshi_fee_multiplier(market)
+        rate = KALSHI_TAKER_COEF * mult
+    return rate * price * (1 - price)
+
+
 def fee_known(platform: str, market: dict) -> bool:
     if platform == "Polymarket":
         return poly_fee_rate(market)[1]

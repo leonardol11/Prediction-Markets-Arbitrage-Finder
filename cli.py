@@ -19,6 +19,12 @@ def main():
     ap.add_argument("--similarity", type=float, default=d.match_display_threshold)
     ap.add_argument("--min-margin", type=float, default=0.0,
                     help="minimum edge as a fraction, e.g. 0.01 for 1%%")
+    ap.add_argument("--near-margin", type=float, default=d.near_margin,
+                    help="watch pairs within this fraction of break-even")
+    ap.add_argument("--llm-budget", type=float, default=d.llm_budget_seconds,
+                    help="seconds of new LLM verification per scan (0 = no limit)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore and do not update the verified-pair cache")
     ap.add_argument("--no-llm", action="store_true", help="skip Groq verification")
     ap.add_argument("--out", default="all_market_matches.xlsx")
     args = ap.parse_args()
@@ -30,10 +36,14 @@ def main():
         combined_threshold=args.similarity,
         match_display_threshold=args.similarity,
         min_margin=args.min_margin,
+        near_margin=args.near_margin,
+        llm_budget_seconds=args.llm_budget,
+        use_verify_cache=not args.no_cache,
         use_llm=not args.no_llm,
     )
     if cfg.use_llm and not cfg.groq_api_key:
-        print("  note: GROQ_API_KEY is unset — running without LLM verification\n")
+        print("  note: GROQ_API_KEY is unset — no new pairs can be verified, and only "
+              "verified pairs count as arbitrage\n")
 
     result = run_scan(cfg)
     path = save_workbook(build_sheets(result), os.path.abspath(args.out))

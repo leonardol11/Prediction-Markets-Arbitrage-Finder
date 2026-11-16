@@ -8,7 +8,7 @@ Runs as a responsive website: live progress, five spreadsheet-style tabs,
 automatic 30-second price refresh, and a one-click `.xlsx` export.
 
 <pre>
-Arbitrage   LLM Verified   Matches   Polymarket   Kalshi
+Live Arbitrage   LLM Verified   Matches   Polymarket   Kalshi
 </pre>
 
 ## Run it
@@ -24,9 +24,11 @@ That opens <http://127.0.0.1:5000> in your browser. Press **Run scan**.
 Flask's development server, which is fine on your own machine. To host it, deploy
 to Vercel (below).
 
-A full scan usually finishes in a couple of minutes. Kalshi's market list is
-mostly combo contracts and has no volume filter, so step 1 reads open events
-instead and keeps the liquid markets nested in them. Progress streams as those
+A scan takes about a minute. Around 25 seconds of that is Kalshi: its market
+list has no volume filter, so step 1 reads every open event and keeps the liquid
+markets nested in them. The rest is LLM verification of new pairs, capped by the
+**LLM time budget**. Verdicts are remembered, so pairs a scan does not reach are
+picked up by the next one and nothing is verified twice. Progress streams as those
 pages come in. Keep the tab open while it runs: closing it stops the scan.
 Results stay loaded after it finishes, and your browser keeps them across page
 reloads.
@@ -96,9 +98,29 @@ export GROQ_API_KEY=gsk_…
 python3 app.py
 ```
 
-Without a key the scan still runs, and the Arbitrage tab falls back to raw
-TF-IDF matches — treat those as leads to check by hand, not as trades. The
-**Match** column on each arb row shows how confident the pairing is.
+Only LLM-verified pairs can appear in **Live Arbitrage**. Without a key the scan
+still runs and lists title matches in **Matches** (marked *Unverified*), but none
+of them is reported as arbitrage. A failed or timed-out LLM call leaves a pair
+unverified; it is never read as a match.
+
+**What the LLM checks.** Each pair gets a strict check that reads both markets'
+resolution rules, end dates and outcomes, and must confirm that Polymarket YES
+and Kalshi YES always resolve the same way. Pairs with no edge first pass a
+cheap title screen so obviously different questions cost few tokens.
+
+**Order and budget.** Groq keys are rate limited by tokens per minute, and that,
+not a fixed pause, is what bounds this step. Requests run concurrently inside
+the limit Groq reports in its response headers and back off when told to. Pairs
+are checked most-promising first: a small positive edge after fees, then larger
+edges (two *different* markets nearly always look mispriced, so a huge edge
+usually means a bad match), then near misses, then the rest. Work stops at the
+**LLM time budget** and resumes on the next scan.
+
+**Verdict cache.** Verdicts are saved in `.cache/verified_pairs.json` and reused
+while both markets' rules, outcomes, deadline and settlement source are
+unchanged; any change to those sends the pair back to the LLM. Entries expire
+after 30 days. On Vercel, where the disk does not persist, the browser keeps the
+verdicts and returns them with the next scan. Delete the file to start over.
 
 > The key hard-coded in the original `All Markets Matcher.py` is committed to
 > this repo's history and now returns 401. Treat it as burned: issue a new one
@@ -112,7 +134,9 @@ TF-IDF matches — treat those as leads to check by hand, not as trades. The
 | Resolves before | today + 180 days | Rolling horizon. Shorter = much faster scan. |
 | Similarity threshold | 0.45 | Lower finds more pairs, and more junk. |
 | Min edge | 0% | Hides arbs below this profit per $1.00 pair. |
+| Watch within | 2% | Verified pairs this close to break-even are marked *Near*. |
 | LLM confidence | 0.65 | Cutoff for keeping an LLM-confirmed pair. |
+| LLM time budget | 45 s | Time one scan may spend on new verdicts. 0 = verify everything, which can take many minutes on a fresh cache. |
 
 ## Command line
 
@@ -120,7 +144,8 @@ Same pipeline, straight to a workbook:
 
 ```bash
 python3 cli.py --min-volume 50000 --cutoff 2026-12-31 --out results.xlsx
-python3 cli.py --no-llm --min-margin 0.02        # only edges of 2%+
+python3 cli.py --min-margin 0.02                 # only edges of 2%+
+python3 cli.py --llm-budget 0                    # verify every candidate pair
 ```
 
 ## How it works
@@ -129,9 +154,16 @@ python3 cli.py --no-llm --min-margin 0.02        # only edges of 2%+
 | --- | --- |
 | 1 | Fetch eligible markets from both venues, concurrently. Kalshi comes from open events, which leaves combo contracts out. |
 | 2 | TF-IDF + Jaccard over the question text, with guards on numbers, months, named entities and resolution dates. |
-| 3 | An LLM confirms each surviving pair resolves on the same outcome. |
-| 4 | Pull live best asks — Polymarket CLOB books and Kalshi orderbooks — for matched markets only. |
-| 5 | Flag every pair whose two legs cost under $1.00 combined. |
+| 3 | Read Polymarket order books in bulk and work out each candidate's preliminary edge after both venues' fees, using the quote Kalshi listed with the market. |
+| 4 | LLM verification, most promising pairs first, reusing cached verdicts. |
+| 5 | Read fresh full-depth books on both venues for every verified pair and keep the ones that cost under $1.00 per pair after fees. |
+
+**Live Arbitrage** walks both order books level by level, so *Exec. size* and
+*Est. profit* cover everything that can be filled at a profit, not only the best
+ask. Kalshi's fee is rounded up to the cent once per order. Quotes older than 30
+seconds, and sizes below Polymarket's minimum order, are left out.
+
+Each stage logs its duration, and the scan log ends with the total.
 
 ## Where results live
 

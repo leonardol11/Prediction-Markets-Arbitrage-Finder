@@ -30,6 +30,7 @@ from flask import Flask, Response, jsonify, render_template, request
 from matcher import (Cancelled, Reporter, ScanConfig, ScanResult, TOTAL_STEPS,
                      build_sheets, build_summary, parse_cutoff, refresh_scan,
                      run_scan, workbook_bytes)
+from matcher.core import pair_id
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -42,7 +43,7 @@ app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
 
 MAX_INFLATED_BYTES = 256 * 1024 * 1024
 REPRICED_SHEETS = ("arbitrage", "verified", "matches")
-CONTEXT_VERSION = 2
+CONTEXT_VERSION = 3
 
 
 def _scan_time_limit() -> float:
@@ -123,8 +124,12 @@ def _serialize_context(result: ScanResult) -> dict:
                 for p, k, shared, score in rows]
 
     matches, verified = pairs(result.matches), pairs(result.verified)
+    # Each match's LLM verdict, so a refresh can still label the rows.
+    status = [result.pair_status.get(pair_id(p, k), "") for p, k, _s, _c in result.matches]
     matched_poly = [add(m, poly, p_ix) for m in result.matched_poly]
     matched_kalshi = [add(m, kalshi, k_ix) for m in result.matched_kalshi]
+    live_kalshi = (None if result.live_kalshi is None
+                   else [add(m, kalshi, k_ix) for m in result.live_kalshi])
     cfg = result.config
     return {
         "version": CONTEXT_VERSION,
@@ -134,12 +139,15 @@ def _serialize_context(result: ScanResult) -> dict:
             "match_display_threshold": cfg.match_display_threshold,
             "groq_confidence_cutoff": cfg.groq_confidence_cutoff,
             "min_margin": cfg.min_margin,
+            "near_margin": cfg.near_margin,
+            "stale_quote_seconds": cfg.stale_quote_seconds,
             "orderbook_workers": cfg.orderbook_workers,
         },
         "poly": poly, "kalshi": kalshi,
         "poly_count": len(result.poly), "kalshi_count": len(result.kalshi),
-        "matches": matches, "verified": verified,
+        "matches": matches, "verified": verified, "status": status,
         "matched_poly": matched_poly, "matched_kalshi": matched_kalshi,
+        "live_kalshi": live_kalshi,
         "started_at": result.started_at.isoformat(),
         "finished_at": (result.finished_at or result.started_at).isoformat(),
         "prices_updated_at": (
@@ -159,6 +167,9 @@ def _restore_context(data):
             match_display_threshold=float(settings["match_display_threshold"]),
             groq_confidence_cutoff=float(settings["groq_confidence_cutoff"]),
             min_margin=float(settings["min_margin"]),
+            near_margin=float(settings["near_margin"]),
+            stale_quote_seconds=float(settings["stale_quote_seconds"]),
+            use_verify_cache=False,
             orderbook_workers=max(1, min(int(settings["orderbook_workers"]), 128)),
             use_llm=False,
         )
@@ -182,6 +193,11 @@ def _restore_context(data):
         result.matches, result.verified = pairs(data["matches"]), pairs(data["verified"])
         result.matched_poly = [market(result.poly, i) for i in data["matched_poly"]]
         result.matched_kalshi = [market(result.kalshi, i) for i in data["matched_kalshi"]]
+        if data.get("live_kalshi") is not None:
+            result.live_kalshi = [market(result.kalshi, i) for i in data["live_kalshi"]]
+        for (p, k, _s, _c), verdict in zip(result.matches, data["status"]):
+            if verdict in ("verified", "rejected"):
+                result.pair_status[pair_id(p, k)] = verdict
         result.started_at = datetime.fromisoformat(data["started_at"])
         result.finished_at = datetime.fromisoformat(data["finished_at"])
         stamp = data.get("prices_updated_at")
@@ -203,6 +219,9 @@ def _payload(result: ScanResult, sheets, summary) -> dict:
         "prices_updated_at": stamp.isoformat() if stamp else None,
         "refresh_available": bool(result.matched_poly or result.matched_kalshi),
         "context": _serialize_context(result),
+        # LLM verdicts for these pairs. The browser sends them back with the next
+        # scan, so a serverless host with no disk still skips repeat LLM calls.
+        "verify_cache": result.verify_cache,
     }
 
 
@@ -220,6 +239,8 @@ def index():
             "similarity": defaults.match_display_threshold,
             "confidence": defaults.groq_confidence_cutoff,
             "min_margin": defaults.min_margin,
+            "near_margin": defaults.near_margin,
+            "llm_budget": int(defaults.llm_budget_seconds),
             "model": defaults.groq_model,
         },
         has_env_key=bool(os.environ.get("GROQ_API_KEY")),
@@ -236,6 +257,7 @@ def _config_from_request(body: dict) -> ScanConfig:
             return default
 
     base = ScanConfig()
+    seed = body.get("verify_cache")
     threshold = f("similarity", base.match_display_threshold)
     return ScanConfig(
         min_volume=max(0.0, f("min_volume", base.min_volume)),
@@ -248,6 +270,9 @@ def _config_from_request(body: dict) -> ScanConfig:
         groq_api_key=(body.get("groq_api_key") or "").strip(),
         groq_confidence_cutoff=f("confidence", base.groq_confidence_cutoff),
         min_margin=max(0.0, f("min_margin", base.min_margin)),
+        near_margin=min(0.5, max(0.0, f("near_margin", base.near_margin))),
+        llm_budget_seconds=max(0.0, f("llm_budget", base.llm_budget_seconds)),
+        verify_cache_seed=seed if isinstance(seed, dict) else {},
     )
 
 
@@ -339,6 +364,7 @@ def refresh():
     summary.update(poly_count=poly_count, kalshi_count=kalshi_count)
     payload = _payload(refreshed, sheets, summary)
     payload["context"].update(poly_count=poly_count, kalshi_count=kalshi_count)
+    payload.pop("verify_cache", None)      # the browser keeps the scan's copy
     return jsonify(payload)
 
 

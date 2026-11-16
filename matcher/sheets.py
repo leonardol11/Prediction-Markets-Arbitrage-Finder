@@ -12,8 +12,8 @@ can never drift apart.
 import json
 from datetime import datetime, timezone
 
-from .core import (_num, days_until, kalshi_end, kalshi_title, pair_days,
-                   poly_end, poly_title)
+from .core import (_num, best_ask, best_quote, days_until, kalshi_end,
+                   kalshi_listed_book, kalshi_title, pair_days, pair_id, poly_end, poly_title, quote_state)
 
 
 # ─────────────────────────────── cell helpers ─────────────────────────────────
@@ -70,6 +70,13 @@ def money(v):
     except (TypeError, ValueError):
         return cell(None, DASH)
     return cell(round(x), f"${round(x):,}", fmt=MONEY_FMT)
+
+
+def dollars(v):
+    """Profit in dollars and cents: 2.26 → '$2.26'."""
+    if not v:
+        return cell(None, DASH)
+    return cell(round(float(v), 2), f"${float(v):,.2f}", fmt='$#,##0.00')
 
 
 def pct(v, places=1):
@@ -152,17 +159,18 @@ def poly_day(market) -> str:
     return (market.get("endDate") or market.get("end_date_iso") or "")[:10]
 
 
-def _poly_ask_pair(ob_side):
-    if not ob_side or ob_side[0] is None:
+def _ask_cells(book, side):
+    """Best ask and the size resting at it, from a live book."""
+    price, size = best_ask(book, side)
+    if price is None:
         return cell(None, DASH), cell(None, DASH)
-    return cents(ob_side[0]), qty(ob_side[1])
+    return cents(price), qty(size)
 
 
-def _kalshi_ask_pairs(kob):
-    if not kob:
-        return (cell(None, DASH),) * 4
-    (a, aq), (b, bq) = kob
-    return cents(a), qty(aq), cents(b), qty(bq)
+def seconds_cell(v):
+    if v is None:
+        return cell(None, DASH)
+    return cell(round(v, 1), f"{v:.0f}s", fmt='0"s"')
 
 
 # ───────────────────────────────── column sets ────────────────────────────────
@@ -179,17 +187,19 @@ ARB_COLUMNS = [
     _col("days", "Days", "center", 64, "num"),
     _col("p_title", "Polymarket market", "left", 300, "text"),
     _col("buy_poly", "Buy", "center", 62, "side"),
-    _col("poly_price", "Price", "center", 66, "num"),
+    _col("poly_price", "Avg price", "center", 76, "num"),
     _col("poly_qty", "Ask qty", "right", 78, "num"),
     _col("k_title", "Kalshi market", "left", 300, "text"),
     _col("buy_kalshi", "Buy", "center", 62, "side"),
-    _col("kalshi_price", "Price", "center", 66, "num"),
+    _col("kalshi_price", "Avg price", "center", 76, "num"),
     _col("kalshi_qty", "Ask qty", "right", 78, "num"),
     _col("gross", "Gross edge", "center", 88, "num"),
     _col("fees", "Fees / pair", "center", 96, "num"),
     _col("cost", "Cost / pair", "center", 88, "num"),
-    _col("size", "Max pairs", "right", 86, "num"),
-    _col("profit", "Max profit", "right", 92, "num"),
+    _col("size", "Exec. size", "right", 86, "num"),
+    _col("profit", "Est. profit", "right", 92, "num"),
+    _col("levels", "Levels", "center", 64, "num"),
+    _col("age", "Quote age", "center", 82, "num"),
     _col("match", "Match", "center", 70, "num"),
     _col("expires", "Resolves", "center", 96, "text"),
     _col("p_vol", "Poly vol", "right", 100, "num"),
@@ -201,6 +211,8 @@ def _match_columns(score_label):
     return [
         _col("num", "#", "center", 48, "num"),
         _col("score", score_label, "center", 92, "num"),
+        _col("status", "Status", "left", 150, "text"),
+        _col("edge", "Net edge", "center", 84, "num"),
         _col("days", "Days", "center", 64, "num"),
         _col("p_title", "Polymarket market", "left", 330, "text"),
         _col("p_date", "Resolves", "center", 100, "text"),
@@ -275,18 +287,20 @@ def _arb_rows(arbs):
             days_cell(arb.get("days")),
             cell(poly_title(p), poly_title(p), poly_url(p)),
             p_side,
-            cents(p_price),
+            cents_fine(p_price),
             qty(p_qty),
             cell(kalshi_title(k), kalshi_title(k), kalshi_url(k)),
             k_side,
-            cents(k_price),
+            cents_fine(k_price),
             qty(k_qty),
             pct(arb.get("gross_margin", arb["margin"]), 2),
             cents_fine(arb.get("fees_per_pair"),
                        " est." if arb.get("fees_estimated") else ""),
             cents_fine(arb.get("cost", arb["prob_sum"])),
             qty(arb.get("max_contracts")),
-            money(arb["max_profit"]) if arb.get("max_profit") else cell(None, DASH),
+            dollars(arb.get("max_profit")),
+            arb.get("levels") or 1,
+            seconds_cell(arb.get("age")),
             pct(arb.get("match_score"), 0),
             day(expires),
             money(_num(p.get("volume"))),
@@ -295,21 +309,45 @@ def _arb_rows(arbs):
     return rows
 
 
-def _match_rows(pairs, poly_ob, kalshi_ob, poly_idx, kalshi_idx):
+EDGE_LABELS = {"live": "Live arb", "stale": "Stale quote", "small": "Below min size",
+               "near": "Near", "none": "No edge", "unpriced": "No live book"}
+
+
+def _status(verdict, state, verified_sheet, listed=None):
+    """One short label: has an LLM confirmed the pair, and is there an edge?"""
+    if verified_sheet:
+        return EDGE_LABELS[state]
+    if verdict == "rejected":
+        return "Rejected by LLM"
+    if verdict == "verified":
+        return f"Verified · {EDGE_LABELS[state].lower()}"
+    if state in ("live", "stale", "small") or (listed and listed["margin"] > 0):
+        return "Unverified · edge"
+    return "Unverified · near" if state == "near" else "Unverified"
+
+
+def _match_rows(pairs, result, poly_idx, kalshi_idx, verified_sheet=False):
     now = datetime.now(timezone.utc)
+    cfg = result.config
     rows = []
     for i, (p, k, shared, score) in enumerate(pairs):
-        pi = poly_idx.get(id(p), -1)
-        ki = kalshi_idx.get(id(k), -1)
-        pob = poly_ob.get(pi, {}) if pi >= 0 else {}
-        kob = kalshi_ob.get(ki) if ki >= 0 else None
-        p_yes_ask, p_yes_qty = _poly_ask_pair(pob.get("yes"))
-        p_no_ask, p_no_qty = _poly_ask_pair(pob.get("no"))
-        k_yes_ask, k_yes_qty, k_no_ask, k_no_qty = _kalshi_ask_pairs(kob)
+        pob = result.poly_ob.get(poly_idx.get(id(p), -1))
+        kob = result.kalshi_ob.get(kalshi_idx.get(id(k), -1))
+        p_yes_ask, p_yes_qty = _ask_cells(pob, "yes")
+        p_no_ask, p_no_qty = _ask_cells(pob, "no")
+        k_yes_ask, k_yes_qty = _ask_cells(kob, "yes")
+        k_no_ask, k_no_qty = _ask_cells(kob, "no")
+        quote = best_quote(p, k, pob, kob, cfg)
+        # No live Kalshi book (the pair is unverified): judge by the listed quote,
+        # for the label only. The Net edge column shows live books and nothing else.
+        listed = None if quote else best_quote(p, k, pob, kalshi_listed_book(k), cfg)
 
         rows.append([
             i + 1,
             pct(score, 0),
+            _status(result.pair_status.get(pair_id(p, k)), quote_state(quote, cfg),
+                    verified_sheet, listed),
+            pct(quote["margin"], 2) if quote else cell(None, DASH),
             days_cell(pair_days(p, k, now)),
             cell(poly_title(p), poly_title(p), poly_url(p)),
             day(poly_day(p)),
@@ -368,27 +406,33 @@ def build_sheets(result) -> list:
     kalshi_idx = {id(m): i for i, m in enumerate(result.matched_kalshi)}
 
     return [
-        {"key": "arbitrage", "name": "Arbitrage",
-         "hint": ("Net of both venues' taker fees, ranked by annualized return (net ROI "
-                  "scaled by days until the later leg settles). \"est.\" = fee data "
-                  "missing, highest standard rate assumed. Confirm both questions resolve alike."),
+        {"key": "arbitrage", "name": "Live Arbitrage",
+         "hint": ("LLM-verified pairs that are profitable right now. Edges are net of both "
+                  "venues' taker fees and averaged over the size the order books can fill "
+                  "at a profit (Exec. size), ranked by annualized return. \"est.\" = fee "
+                  f"data missing, highest standard rate assumed. Quotes older than "
+                  f"{result.config.stale_quote_seconds:.0f}s are left out."),
          "columns": ARB_COLUMNS, "rows": _arb_rows(result.arbs),
-         "empty": "No arbitrage on current best asks after fees — the matched books all cost $1.00 or more per pair."},
+         "empty": ("No live arbitrage: no LLM-verified pair costs under $1.00 per pair "
+                   "after fees on current order books.")},
 
         {"key": "verified", "name": "LLM Verified",
-         "hint": f"Pairs an LLM confirmed resolve on the same outcome (≥{result.config.groq_confidence_cutoff:.0%} confidence).",
+         "hint": (f"Every pair an LLM confirmed resolves on the same outcome "
+                  f"(≥{result.config.groq_confidence_cutoff:.0%} confidence), including "
+                  "verdicts reused from earlier scans, whether or not there is an edge now."),
          "columns": _match_columns("Confidence"),
-         "rows": _match_rows(result.verified, result.poly_ob, result.kalshi_ob,
-                             poly_idx, kalshi_idx),
-         "empty": ("LLM verification was off for this scan."
+         "rows": _match_rows(result.verified, result, poly_idx, kalshi_idx,
+                             verified_sheet=True),
+         "empty": ("No verified pairs yet. LLM verification was off for this scan."
                    if not result.llm_used else
-                   "The LLM confirmed none of the candidate pairs.")},
+                   "The LLM has not confirmed any of the candidate pairs.")},
 
         {"key": "matches", "name": "Matches",
-         "hint": f"Title pairs above {result.config.match_display_threshold:.0%} combined TF-IDF + Jaccard similarity.",
+         "hint": (f"Title pairs above {result.config.match_display_threshold:.0%} combined "
+                  "TF-IDF + Jaccard similarity. Unverified pairs are never counted as "
+                  "arbitrage; live Kalshi books are fetched only for pairs near an edge."),
          "columns": _match_columns("Similarity"),
-         "rows": _match_rows(result.matches, result.poly_ob, result.kalshi_ob,
-                             poly_idx, kalshi_idx),
+         "rows": _match_rows(result.matches, result, poly_idx, kalshi_idx),
          "empty": "No title pairs cleared the similarity threshold. Try lowering it."},
 
         {"key": "polymarket", "name": "Polymarket",
@@ -406,12 +450,17 @@ def build_sheets(result) -> list:
 def build_summary(result) -> dict:
     # Arbs are ranked by annualized return, so the biggest raw edge may not be first.
     best = max((a["margin"] for a in result.arbs), default=None)
+    judged = set(result.pair_status) | {pair_id(p, k) for p, k, _s, _c in result.verified}
     return {
         "poly_count": len(result.poly),
         "kalshi_count": len(result.kalshi),
         "match_count": len(result.matches),
         "verified_count": len(result.verified),
         "arb_count": len(result.arbs),
+        "pending_count": sum(1 for p, k, _s, _c in result.matches
+                             if pair_id(p, k) not in judged),
+        "timings": result.timings,
+        "llm_stats": result.llm_stats,
         "best_margin": best,
         "best_margin_display": f"{best * 100:.2f}%" if best else DASH,
         "arb_source": result.arb_source_label,

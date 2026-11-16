@@ -57,7 +57,7 @@
     <span>Markets discovered <time id="discovery-updated">Not yet</time></span>
   </div>
   <p id="live-message" class="live-message" role="status" aria-live="polite">Run a full scan to discover matching markets and enable live prices.</p>
-  <p id="discovery-note" class="discovery-note">Run scan discovers new markets and matches; it can take a few minutes. Live refresh only reprices matched orderbooks and recalculates arbitrage. Raw market tabs remain discovery snapshots.{% if scan_time_limit %} This server stops scans after {{ scan_time_limit }}s; a sooner <b>Resolves before</b> date or a higher minimum volume keeps scans inside that limit.{% endif %}</p>
+  <p id="discovery-note" class="discovery-note">Run scan discovers new markets and matches. Pairs with an edge are LLM-verified first and verdicts are remembered, so later scans are quicker. Live refresh only reprices matched orderbooks and recalculates arbitrage. Raw market tabs remain discovery snapshots.{% if scan_time_limit %} This server stops scans after {{ scan_time_limit }}s; a sooner <b>Resolves before</b> date or a higher minimum volume keeps scans inside that limit.{% endif %}</p>
 </section>
 
 <section id="settings" class="settings" hidden>
@@ -83,9 +83,19 @@
       <small>Hide arbs below this profit per $1 pair.</small>
     </label>
     <label class="field">
+      <span>Watch within (%)</span>
+      <input id="near_margin" type="number" min="0" max="50" step="0.5" value="{{ (defaults.near_margin * 100) | round(2) }}">
+      <small>Pairs this close to break-even are verified first and marked Near.</small>
+    </label>
+    <label class="field">
       <span>LLM confidence</span>
       <input id="confidence" type="number" min="0" max="1" step="0.05" value="{{ defaults.confidence }}">
       <small>Cutoff for keeping an LLM-confirmed pair.</small>
+    </label>
+    <label class="field">
+      <span>LLM time budget (s)</span>
+      <input id="llm_budget" type="number" min="0" step="15" value="{{ defaults.llm_budget }}">
+      <small>Per scan, for new verdicts. Unchecked pairs carry over; 0 = no limit.</small>
     </label>
     <label class="field field-wide">
       <span>Groq API key</span>
@@ -130,12 +140,12 @@
          of them pays out $1.00.</p>
       <ol class="steps">
         <li><b>Fetch</b><span>Every liquid market on both venues, filtered by volume and resolution date.</span></li>
-        <li><b>Match</b><span>Question text is paired by similarity, with optional LLM verification.</span></li>
+        <li><b>Match</b><span>Question text is paired by similarity; an LLM then checks both markets' rules. Only verified pairs count as arbitrage.</span></li>
         <li><b>Monitor</b><span>Matched orderbooks refresh every 30 seconds while this page stays open.</span></li>
       </ol>
-      <p class="empty-cta" id="empty-cta">Press <strong>Run scan</strong> to start. The first
-         pass takes a few minutes — Kalshi has no volume filter, so every open
-         market has to be walked.</p>
+      <p class="empty-cta" id="empty-cta">Press <strong>Run scan</strong> to start. A scan
+         takes about a minute: Kalshi has no volume filter, so every open
+         market has to be walked, and new pairs are LLM-verified within a time budget.</p>
       <button id="empty-run-btn" class="btn btn-primary empty-run-btn" disabled>Run scan</button>
     </div>
     <table id="grid" class="grid" aria-label="Active market data sheet" hidden>

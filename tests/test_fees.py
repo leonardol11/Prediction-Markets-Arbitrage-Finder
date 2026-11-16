@@ -4,8 +4,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from matcher.config import ScanConfig
-from matcher.core import Reporter, find_arbitrage
-from matcher.fees import kalshi_taker_fee, poly_taker_fee
+from matcher.core import Reporter, find_arbitrage, make_book
+from matcher.fees import kalshi_taker_fee, order_fee, poly_taker_fee
 
 POLITICS = {"feesEnabled": True, "feeSchedule": {"rate": 0.04, "exponent": 1}}
 KALSHI_STD = {"_fee_type": "quadratic", "_fee_multiplier": 1}
@@ -46,6 +46,12 @@ class KalshiFeeTests(unittest.TestCase):
         self.assertAlmostEqual(kalshi_taker_fee(half, 100, 0.5), 0.88)   # 0.875 → 88¢
         self.assertEqual(kalshi_taker_fee(free, 100, 0.5), 0)
 
+    def test_one_order_across_price_levels_rounds_once(self):
+        # 10 at 30¢ and 10 at 40¢ in one order: 0.147 + 0.168 = 0.315 → 32¢,
+        # not 15¢ + 17¢ as two separately rounded orders would be.
+        self.assertAlmostEqual(order_fee("Kalshi", KALSHI_STD, [(10, 0.3), (10, 0.4)]), 0.32)
+        self.assertAlmostEqual(order_fee("Polymarket", POLITICS, [(100, 0.5), (100, 0.5)]), 2.0)
+
     def test_unknown_fee_type_assumes_standard(self):
         self.assertAlmostEqual(kalshi_taker_fee({"_fee_type": "flat"}, 100, 0.5), 1.75)
         self.assertAlmostEqual(kalshi_taker_fee({}, 100, 0.5), 1.75)
@@ -56,8 +62,8 @@ class NetArbitrageTests(unittest.TestCase):
         end = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
         poly = {**POLITICS, "endDate": end}
         kalshi = {**KALSHI_STD, "expected_expiration_time": end}
-        pob = {0: {"yes": (poly_yes, size), "no": (0.99, size)}}
-        kob = {0: ((0.99, size), (kalshi_no, size))}
+        pob = {0: make_book(yes=[(poly_yes, size)], no=[(0.99, size)])}
+        kob = {0: make_book(yes=[(0.99, size)], no=[(kalshi_no, size)])}
         return find_arbitrage([(poly, kalshi, set(), 0.9)], [poly], [kalshi],
                               pob, kob, ScanConfig(), Reporter())
 
